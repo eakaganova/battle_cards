@@ -5,53 +5,111 @@ from openai import OpenAI
 
 URL = "https://www.tbank.ru/travel/"
 
-st.title("Парсер + LLM")
+st.title("Парсер + LLM (MVP)")
 
-# ключ лучше хранить через Streamlit secrets или env
-YANDEX_CLOUD_FOLDER = st.text_input("Folder ID")
-YANDEX_API_KEY = st.text_input("API Key", type="password")
+# -----------------------
+# INPUT
+# -----------------------
+
+api_key = st.text_input("Yandex API Key", type="password")
+folder_id = st.text_input("Folder ID")
 
 MODEL = "gpt://b1gd45ibb82t3i8g80fn/gpt-oss-120b/latest"
 
 
-def get_llm_client(api_key: str, folder: str):
+def get_client(api_key: str, folder_id: str):
     return OpenAI(
         api_key=api_key,
         base_url="https://ai.api.cloud.yandex.net/v1",
-        project=folder
+        project=folder_id
     )
 
 
-if st.button("Собрать и проанализировать"):
-    try:
-        # 1. Парсим страницу
-        r = requests.get(URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        r.encoding = "utf-8"
+# -----------------------
+# PARSER
+# -----------------------
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text(" ", strip=True)[:2000]  # ограничим для LLM
+def parse_page(url: str) -> str:
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
 
-        st.subheader("Сырой текст (обрезка)")
-        st.code(text[:200])
+    # важно для твоей ошибки с кракозябрами
+    r.encoding = "utf-8"
 
-        # 2. LLM запрос
-        if not (YANDEX_API_KEY and YANDEX_CLOUD_FOLDER):
-            st.warning("Введите API key и Folder ID")
-            st.stop()
+    soup = BeautifulSoup(r.text, "html.parser")
 
-        client = get_llm_client(YANDEX_API_KEY, YANDEX_CLOUD_FOLDER)
+    # убираем мусорные теги
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
 
-        response = client.responses.create(
-            model=MODEL,
-            temperature=0.3,
-            max_output_tokens=500,
-            instructions="Ты аналитик. Кратко опиши, что за сервис на странице.",
-            input=text
-        )
+    text = soup.get_text(" ", strip=True)
 
-        st.subheader("Ответ LLM")
-        st.write(response.output_text)
+    return text
 
-    except Exception as e:
-        st.error("Ошибка")
-        st.exception(e)
+
+# -----------------------
+# LLM PROMPT (1 штука)
+# -----------------------
+
+PROMPT = """
+Ты аналитик цифровых продуктов.
+
+Тебе дан текст страницы сервиса.
+
+Задача:
+1. Определи, что это за сервис
+2. Выдели ключевые функции
+3. Сформируй таблицу
+
+Формат таблицы строго:
+
+| Параметр | Значение |
+|---|---|
+| Сервис | |
+| Основное назначение | |
+| Ключевые функции | |
+| Целевая аудитория | |
+| Основные сценарии использования | |
+
+Если данных нет — пиши "Не указано".
+Не добавляй лишний текст.
+"""
+
+
+# -----------------------
+# RUN
+# -----------------------
+
+if st.button("Запуск"):
+
+    if not api_key or not folder_id:
+        st.error("Введите API key и folder_id")
+        st.stop()
+
+    # 1. Парсинг
+    st.subheader("1. Парсинг страницы")
+
+    text = parse_page(URL)
+
+    st.write("Сырый текст (обрезка):")
+    st.code(text[:500])
+
+    # ограничиваем LLM
+    text = text[:6000]
+
+    # 2. LLM
+    st.subheader("2. LLM анализ")
+
+    client = get_client(api_key, folder_id)
+
+    response = client.responses.create(
+        model=MODEL,
+        temperature=0.2,
+        max_output_tokens=800,
+        instructions=PROMPT,
+        input=text
+    )
+
+    result = response.output[0].content[0].text
+
+    st.subheader("Результат")
+    st.markdown(result)
