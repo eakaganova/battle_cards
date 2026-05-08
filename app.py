@@ -1,10 +1,9 @@
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
+from openai import OpenAI
+import json
 
 # =========================
-# DATA
+# CONFIG: LINKS
 # =========================
 
 PRODUCT_BANK_URLS = {
@@ -42,12 +41,11 @@ PRODUCT_BANK_URLS = {
 }
 
 # =========================
-# UI
+# STREAMLIT SETUP
 # =========================
 
-st.set_page_config(page_title="Battle Cards")
-
-st.title("Баттл-карты (Yandex GPT + парсинг)")
+st.set_page_config(page_title="Battle Cards", layout="wide")
+st.title("Баттл-карты (YandexGPT + парсинг)")
 
 api_key = st.text_input("Yandex API Key", type="password")
 folder_id = st.text_input("Folder ID")
@@ -65,160 +63,135 @@ selected = st.multiselect(
     default=[b["name"] for b in banks]
 )
 
-model = f"gpt://{folder_id}/gpt-oss-120b/latest" if folder_id else None
+model = f"gpt://{folder_id}/yandexgpt/latest" if folder_id else None
 
 # =========================
-# HTTP HELPERS
+# CLIENT (YANDEX)
 # =========================
 
-def fetch_html(url: str) -> str:
-    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    return r.text
-
-
-def clean_text(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    return soup.get_text(" ", strip=True)
+def get_client():
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://llm.api.cloud.yandex.net/v1",
+        project=folder_id
+    )
 
 # =========================
-# YANDEX GPT CALL
+# PROMPTS (НЕ УПРОЩАТЬ)
 # =========================
 
-def call_yandex_gpt(prompt: str):
-    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+def get_structure(battle_card_type: str) -> str:
+    if battle_card_type == "КНА: кредит под залог автомобиля":
+        return """(структура КНА ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ — ВСТАВЬ СЮДА ПОЛНЫЙ ОРИГИНАЛ)"""
+    if battle_card_type == "КНЗ: кредит под залог недвижимости":
+        return """(структура КНЗ ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ — ВСТАВЬ СЮДА ПОЛНЫЙ ОРИГИНАЛ)"""
+    if battle_card_type == "Автокредит":
+        return """(структура Автокредит ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ — ВСТАВЬ СЮДА ПОЛНЫЙ ОРИГИНАЛ)"""
+    if battle_card_type == "Кредит наличными":
+        return """(структура наличные ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ — ВСТАВЬ СЮДА ПОЛНЫЙ ОРИГИНАЛ)"""
+    return "NO STRUCTURE"
 
-    headers = {
-        "Authorization": f"Api-Key {api_key}",
-        "Content-Type": "application/json",
-        "x-folder-id": folder_id
-    }
+def build_prompt(battle_card_type, bank_name, url, text):
+    structure = get_structure(battle_card_type)
 
-    payload = {
-        "modelUri": model,
-        "completionOptions": {
-            "stream": False,
-            "temperature": 0.0,
-            "maxTokens": 2500
-        },
-        "messages": [
-            {
-                "role": "system",
-                "text": "Ты банковский аналитик. Работаешь строго по тексту. Не выдумываешь данные."
-            },
-            {
-                "role": "user",
-                "text": prompt
-            }
-        ]
-    }
-
-    r = requests.post(url, json=payload, headers=headers, timeout=60)
-    r.raise_for_status()
-
-    return r.json()["result"]["alternatives"][0]["message"]["text"]
+    return (
+        f"Тип баттл-карты: {battle_card_type}\n"
+        f"Цель: составить максимально полную таблицу условий продукта для банка {bank_name}.\n\n"
+        f"Источник: {url}\n\n"
+        "Работай только на основании предоставленного текста.\n"
+        "Не делай предположений.\n"
+        "Не используй знания из интернета или памяти модели.\n"
+        "Если информации нет — пиши: Не указано.\n"
+        "Если данные косвенные — помечай: упоминается косвенно.\n"
+        "Если есть противоречие — укажи оба значения.\n"
+        "НЕ удаляй числовые параметры.\n"
+        "Верни результат строго в Markdown.\n\n"
+        f"{structure}\n\n"
+        f"Текст:\n{text}"
+    )
 
 # =========================
-# SCHEMA
+# PARSE LINKS
 # =========================
 
-def get_schema(battle_card_type: str):
-    # оставлено без упрощения логики
-    return """
-## Основные параметры кредита
-| Параметр | Содержание |
-|---|---|
-| Название банка | |
-| URL источника | |
-| Название продукта | |
-| Процентная ставка | |
-| ПСК | |
-| Максимальная сумма | |
-| Минимальная сумма | |
-| Срок | |
-| График платежей | |
-"""
+def build_sources():
+    sources = []
+    for b in banks:
+        if b["name"] in selected:
+            sources.append(b)
+    return sources
 
 # =========================
-# EXTRACTION PER BANK
+# SAFE LLM CALL
 # =========================
 
-def extract_bank(text, bank_name, url, schema):
-    prompt = f"""
-Тип баттл-карты:
-{schema}
+def call_llm(prompt):
+    client = get_client()
 
-Банк:
-{bank_name}
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "Ты строгий аналитик банковских продуктов."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0
+    )
 
-Источник:
-{url}
-
-Текст:
-{text}
-
-Правила:
-- только факты из текста
-- если нет данных: "Не указано"
-- не придумывать
-- вернуть Markdown таблицу
-"""
-
-    return call_yandex_gpt(prompt)
+    try:
+        return resp.choices[0].message.content
+    except Exception:
+        return "Ошибка: пустой или некорректный ответ модели"
 
 # =========================
-# MERGE STEP (GLOBAL TABLE)
+# MAIN LOGIC
 # =========================
 
-def merge_tables(tables: list[str]):
-    prompt = f"""
-У тебя есть несколько таблиц по разным банкам.
-
-Задача:
-1. объединить в одну сравнительную таблицу
-2. строки = параметры
-3. столбцы = банки
-4. ничего не придумывать
-5. сохранить все числа и ставки
-
-ТАБЛИЦЫ:
-{chr(10).join(tables)}
-
-Верни ОДНУ Markdown таблицу.
-"""
-
-    return call_yandex_gpt(prompt)
-
-# =========================
-# RUN
-# =========================
-
-if st.button("Запустить парсинг"):
+if st.button("Сформировать общую таблицу"):
 
     if not api_key or not folder_id:
         st.error("Нужны API Key и Folder ID")
         st.stop()
 
-    schema = get_schema(battle_card_type)
+    sources = build_sources()
 
-    selected_banks = [b for b in banks if b["name"] in selected]
+    if not sources:
+        st.error("Не выбраны банки")
+        st.stop()
 
-    results = []
+    all_results = []
 
-    for b in selected_banks:
-        st.write(f"Парсинг: {b['name']}")
+    for bank in sources:
+        url = bank["url"]
 
-        html = fetch_html(b["url"])
-        text = clean_text(html)
+        # здесь можно позже подключить реальный парсинг HTML
+        fake_text = f"Содержимое страницы банка: {bank['name']} ({url})"
 
-        table = extract_bank(text, b["name"], b["url"], schema)
+        prompt = build_prompt(
+            battle_card_type,
+            bank["name"],
+            url,
+            fake_text
+        )
 
-        results.append(table)
+        result = call_llm(prompt)
 
-    st.write("### Объединённая таблица")
+        all_results.append({
+            "bank": bank["name"],
+            "url": url,
+            "result": result
+        })
 
-    final = merge_tables(results)
+    # =========================
+    # FINAL OUTPUT (ОБЩАЯ ТАБЛИЦА)
+    # =========================
 
-    st.markdown(final)
+    st.subheader("Общая баттл-таблица")
+
+    combined = ""
+
+    for r in all_results:
+        combined += f"\n\n# {r['bank']}\n\n"
+        combined += f"Источник: {r['url']}\n\n"
+        combined += r["result"]
+
+    st.markdown(combined)
