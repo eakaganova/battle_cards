@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import json
 import os
 import re
@@ -1122,7 +1120,7 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> tuple[pd.
                     user_message=f"{bank_name}: текст передан в LLM, извлекаются параметры продукта.",
                 )
 
-                prompt = build_prompt(
+                prompt = build_extraction_prompt(
                     battle_card_type=battle_card_type,
                     bank_name=bank_name,
                     url=bank_url,
