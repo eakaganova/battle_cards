@@ -1,8 +1,12 @@
+import json
 import os
+import re
 import time
 import traceback
+from typing import Any
 
 import openai
+import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
@@ -30,6 +34,67 @@ PRODUCT_BANK_URLS = {
     "Кредит наличными": [
         {"name": "Сбер", "url": "https://www.sberbank.ru"},
         {"name": "ВТБ", "url": "https://www.vtb.ru"},
+    ],
+}
+
+
+PARAMETER_SETS = {
+    "КНЗ: кредит под залог недвижимости": [
+        "URL источника",
+        "Процентная ставка",
+        "ПСК",
+        "Максимальная сумма кредита",
+        "Минимальная сумма кредита",
+        "Срок",
+        "LTV / доля от стоимости недвижимости",
+        "Обеспечение / объект залога",
+        "Страхование",
+        "Требования к заёмщику",
+        "Требования к недвижимости",
+        "Подтверждение дохода",
+        "Способ получения денег",
+        "Досрочное погашение",
+        "Комиссии",
+        "Особые условия / ограничения",
+        "Документы",
+        "Как оформить",
+        "Что не указано на странице",
+        "Статус парсинга",
+    ],
+    "КНА: кредит под залог автомобиля": [
+        "URL источника",
+        "Процентная ставка",
+        "ПСК",
+        "Максимальная сумма",
+        "Минимальная сумма",
+        "Срок",
+        "Требуется ли авто в залог",
+        "LTV / доля от стоимости автомобиля",
+        "Кто может пользоваться автомобилем",
+        "Требования к автомобилю",
+        "Требования к заёмщику",
+        "Подтверждение дохода",
+        "Страхование",
+        "Комиссии",
+        "Документы",
+        "Как оформить",
+        "Особые условия / ограничения",
+        "Что не указано на странице",
+        "Статус парсинга",
+    ],
+    "Кредит наличными": [
+        "URL источника",
+        "Процентная ставка",
+        "ПСК",
+        "Сумма",
+        "Срок",
+        "Требования к заёмщику",
+        "Документы",
+        "Страхование",
+        "Комиссии",
+        "Как оформить",
+        "Что не указано на странице",
+        "Статус парсинга",
     ],
 }
 
@@ -71,8 +136,8 @@ def log(message: str) -> None:
 
 
 def render_logs() -> None:
-    st.subheader("Логи")
-    st.code("\n".join(st.session_state.logs[-700:]))
+    with st.expander("Технические логи"):
+        st.code("\n".join(st.session_state.logs[-900:]))
 
 
 status_box = st.empty()
@@ -482,83 +547,11 @@ def get_page_text(url: str) -> str:
 
 
 # =========================
-# PROMPTS
+# PROMPT / JSON EXTRACTION
 # =========================
 
-def get_structure(battle_card_type: str) -> str:
-    if battle_card_type == "КНЗ: кредит под залог недвижимости":
-        return """
-## Основные параметры кредита
-
-| Параметр | Содержание |
-|---|---|
-| Название банка | |
-| URL источника | |
-| Процентная ставка | |
-| ПСК | |
-| Максимальная сумма кредита | |
-| Минимальная сумма кредита | |
-| Срок | |
-| LTV / доля от стоимости недвижимости | |
-| Обеспечение / объект залога | |
-| Страхование | |
-| Требования к заёмщику | |
-| Требования к недвижимости | |
-| Подтверждение дохода | |
-| Способ получения денег | |
-| Досрочное погашение | |
-| Комиссии | |
-| Особые условия / ограничения | |
-| Документы | |
-| Как оформить | |
-| Что не указано на странице | |
-"""
-
-    if battle_card_type == "КНА: кредит под залог автомобиля":
-        return """
-## Основные параметры кредита
-
-| Параметр | Содержание |
-|---|---|
-| Название банка | |
-| URL источника | |
-| Процентная ставка | |
-| ПСК | |
-| Максимальная сумма | |
-| Минимальная сумма | |
-| Срок | |
-| Требуется ли авто в залог | |
-| LTV / доля от стоимости автомобиля | |
-| Кто может пользоваться автомобилем | |
-| Требования к автомобилю | |
-| Требования к заёмщику | |
-| Подтверждение дохода | |
-| Страхование | |
-| Комиссии | |
-| Документы | |
-| Как оформить | |
-| Особые условия / ограничения | |
-| Что не указано на странице | |
-"""
-
-    return """
-## Параметры
-
-| Параметр | Содержание |
-|---|---|
-| Название банка | |
-| URL источника | |
-| Процентная ставка | |
-| ПСК | |
-| Сумма | |
-| Срок | |
-| Требования к заёмщику | |
-| Документы | |
-| Страхование | |
-| Комиссии | |
-| Как оформить | |
-| Что не указано на странице | |
-"""
+def get_parameters(battle_card_type: str) -> list[str]:
+    return PARAMETER_SETS[battle_card_type]
 
 
 def build_prompt(
@@ -567,13 +560,13 @@ def build_prompt(
     url: str,
     source_text: str,
 ) -> str:
-    structure = get_structure(battle_card_type)
+    parameters = get_parameters(battle_card_type)
 
     return f"""
 ТЫ — аналитик по банковским продуктам.
 
 ЗАДАЧА:
-Извлечь параметры продукта из текста страницы банка и оформить battle card.
+Извлечь параметры продукта из текста страницы банка.
 
 ТИП ПРОДУКТА:
 {battle_card_type}
@@ -583,6 +576,9 @@ def build_prompt(
 
 URL:
 {url}
+
+ПАРАМЕТРЫ ДЛЯ ИЗВЛЕЧЕНИЯ:
+{json.dumps(parameters, ensure_ascii=False, indent=2)}
 
 СТРОГИЕ ПРАВИЛА:
 - Используй только текст источника ниже.
@@ -594,19 +590,21 @@ URL:
 - Если есть условия типа "от", "до", "при выполнении условий", обязательно сохрани эти оговорки.
 - Не превращай "от 5%" в "5%".
 - Не делай вывод о выгодности продукта.
-- Верни результат строго по шаблону.
+- Верни только JSON без Markdown, без пояснений, без ```.
 
-ШАБЛОН:
-{structure}
+ФОРМАТ JSON:
+{{
+  "Название банка": "{bank_name}",
+  "URL источника": "{url}",
+  "Процентная ставка": "...",
+  "ПСК": "...",
+  "...": "..."
+}}
 
 ТЕКСТ ИСТОЧНИКА:
 {source_text}
 """
 
-
-# =========================
-# LLM
-# =========================
 
 def extract_llm_text(response) -> str | None:
     try:
@@ -629,28 +627,124 @@ def extract_llm_text(response) -> str | None:
 def call_llm(prompt: str):
     return client.responses.create(
         model=f"gpt://{YANDEX_FOLDER}/{YANDEX_MODEL}",
-        temperature=0.2,
+        temperature=0.1,
         input=prompt,
         max_output_tokens=3000,
     )
+
+
+def parse_json_from_llm(raw_text: str) -> dict[str, Any]:
+    if not raw_text:
+        raise ValueError("Пустой ответ LLM")
+
+    cleaned = raw_text.strip()
+
+    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^```\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+
+    if not match:
+        raise ValueError(f"Не найден JSON в ответе LLM: {cleaned[:500]}")
+
+    parsed = json.loads(match.group(0))
+
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON должен быть объектом")
+
+    return parsed
+
+
+def normalize_bank_record(
+    battle_card_type: str,
+    bank_name: str,
+    bank_url: str,
+    parsed: dict[str, Any],
+    status: str,
+) -> dict[str, str]:
+    parameters = get_parameters(battle_card_type)
+
+    record = {
+        "Банк": bank_name,
+    }
+
+    for parameter in parameters:
+        value = parsed.get(parameter, "Не указано")
+
+        if value is None or value == "":
+            value = "Не указано"
+
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value, ensure_ascii=False)
+
+        record[parameter] = str(value)
+
+    record["URL источника"] = bank_url
+    record["Статус парсинга"] = status
+
+    return record
+
+
+def make_error_record(
+    battle_card_type: str,
+    bank_name: str,
+    bank_url: str,
+    status: str,
+) -> dict[str, str]:
+    parameters = get_parameters(battle_card_type)
+
+    record = {
+        "Банк": bank_name,
+    }
+
+    for parameter in parameters:
+        record[parameter] = "Не указано"
+
+    record["URL источника"] = bank_url
+    record["Статус парсинга"] = status
+
+    return record
+
+
+def build_comparison_table(records: list[dict[str, str]], battle_card_type: str) -> pd.DataFrame:
+    parameters = get_parameters(battle_card_type)
+    columns = ["Банк"] + parameters
+
+    df = pd.DataFrame(records)
+
+    for column in columns:
+        if column not in df.columns:
+            df[column] = "Не указано"
+
+    df = df[columns]
+
+    return df
 
 
 # =========================
 # PIPELINE
 # =========================
 
-def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> str | None:
+def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFrame | None:
     try:
         st.session_state.logs = []
         set_status("Запуск")
 
-        all_results = []
+        records = []
 
         for bank in selected_banks:
-            try:
-                bank_name = bank["name"]
-                bank_url = bank["url"]
+            bank_name = bank["name"]
+            bank_url = bank["url"]
 
+            try:
                 set_status(f"Парсинг: {bank_name}")
 
                 log("=" * 80)
@@ -666,16 +760,13 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> str | Non
                 if not page_text or len(page_text.strip()) < 1000:
                     log(f"TEXT TOO SMALL AFTER ALL PARSERS: {bank_name} ({text_size})")
 
-                    all_results.append(
-                        f"""
-## {bank_name}
-
-Не удалось извлечь достаточный объём текста.
-
-Размер текста: {text_size}
-
-URL: {bank_url}
-"""
+                    records.append(
+                        make_error_record(
+                            battle_card_type=battle_card_type,
+                            bank_name=bank_name,
+                            bank_url=bank_url,
+                            status=f"Недостаточно текста: {text_size} символов",
+                        )
                     )
                     continue
 
@@ -697,51 +788,60 @@ URL: {bank_url}
                 response = call_llm(prompt)
                 log("LLM response received")
 
-                result_text = extract_llm_text(response)
+                raw_text = extract_llm_text(response)
 
-                if not result_text:
+                if not raw_text:
                     log(f"EMPTY OUTPUT: {bank_name}")
                     log(str(response))
 
-                    all_results.append(
-                        f"""
-## {bank_name}
-
-LLM вернула пустой ответ.
-
-URL: {bank_url}
-"""
+                    records.append(
+                        make_error_record(
+                            battle_card_type=battle_card_type,
+                            bank_name=bank_name,
+                            bank_url=bank_url,
+                            status="LLM вернула пустой ответ",
+                        )
                     )
                     continue
 
-                all_results.append(result_text)
+                log(f"LLM raw preview:\n{raw_text[:1000]}")
+
+                parsed = parse_json_from_llm(raw_text)
+
+                record = normalize_bank_record(
+                    battle_card_type=battle_card_type,
+                    bank_name=bank_name,
+                    bank_url=bank_url,
+                    parsed=parsed,
+                    status="ОК",
+                )
+
+                records.append(record)
 
             except Exception:
                 err = traceback.format_exc()
 
-                log(f"ERROR BANK: {bank.get('name', 'UNKNOWN')}")
+                log(f"ERROR BANK: {bank_name}")
                 log(err)
 
-                all_results.append(
-                    f"""
-## {bank.get("name", "UNKNOWN")}
-
-Ошибка обработки банка.
-
-```text
-{err}
-```
-"""
+                records.append(
+                    make_error_record(
+                        battle_card_type=battle_card_type,
+                        bank_name=bank_name,
+                        bank_url=bank_url,
+                        status=f"Ошибка: {err[-700:]}",
+                    )
                 )
 
-        if not all_results:
-            log("NO RESULTS")
+        if not records:
+            log("NO RECORDS")
             return None
 
-        final_report = "\n\n---\n\n".join(all_results)
+        comparison_df = build_comparison_table(records, battle_card_type)
+
         set_status("Готово")
 
-        return final_report
+        return comparison_df
 
     except Exception:
         log("PIPELINE ERROR")
@@ -756,9 +856,8 @@ URL: {bank_url}
 st.title("Battle Cards Generator")
 
 st.caption(
-    "Парсер сначала пробует requests, затем при слабом результате запускает "
-    "Playwright: открывает страницу в headless-браузере, кликает раскрывающиеся "
-    "элементы и собирает текст."
+    "На выходе формируется одна общая сравнительная таблица по выбранным банкам. "
+    "Отдельные карточки банков пользователю не выводятся."
 )
 
 battle_card_type = st.selectbox(
@@ -785,12 +884,22 @@ with st.expander("Текущие URL"):
         st.write(f"**{bank['name']}** — {bank['url']}")
 
 if st.button("Запустить анализ"):
-    result = run_pipeline(battle_card_type, selected_banks)
+    result_df = run_pipeline(battle_card_type, selected_banks)
 
-    if result:
+    if result_df is not None and not result_df.empty:
         st.success("Готово")
-        st.markdown(result)
+        st.subheader("Сравнительная таблица банков")
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+        csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+
+        st.download_button(
+            label="Скачать CSV",
+            data=csv_bytes,
+            file_name="bank_comparison.csv",
+            mime="text/csv",
+        )
     else:
-        st.error("Получен пустой результат. Смотри логи.")
+        st.error("Получен пустой результат. Смотри технические логи.")
 
 render_logs()
