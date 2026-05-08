@@ -6,7 +6,7 @@ import os
 import re
 import time
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import openai
 import pandas as pd
@@ -127,8 +127,8 @@ YANDEX_MODEL = os.getenv("YANDEX_MODEL", "gpt-oss-120b/latest")
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 
 MAX_SOURCE_CHARS = 25000
-REQUESTS_TIMEOUT = 15
-PLAYWRIGHT_TIMEOUT = 45000
+REQUESTS_TIMEOUT = 8
+PLAYWRIGHT_TIMEOUT = 20000
 
 
 # =========================
@@ -157,12 +157,17 @@ defaults = {
     "user_updates": [],
     "custom_params_text": "\n".join(DEFAULT_CUSTOM_PARAMS),
     "custom_companies": [
-        {"name": "", "url": ""},
-        {"name": "", "url": ""},
-        {"name": "", "url": ""},
+        {"name": "", "url": "", "manual_text": ""},
+        {"name": "", "url": "", "manual_text": ""},
+        {"name": "", "url": "", "manual_text": ""},
     ],
     "last_df": None,
     "last_raw_records": [],
+    "pending_manual_requests": [],
+    "pipeline_context": None,
+    "base_records": [],
+    "manual_records": [],
+    "last_columns": [],
 }
 
 for key, value in defaults.items():
@@ -216,6 +221,11 @@ def reset_runtime_state() -> None:
     st.session_state.user_updates = []
     st.session_state.last_df = None
     st.session_state.last_raw_records = []
+    st.session_state.pending_manual_requests = []
+    st.session_state.pipeline_context = None
+    st.session_state.base_records = []
+    st.session_state.manual_records = []
+    st.session_state.last_columns = []
 
 
 def render_runtime_panel() -> None:
@@ -242,7 +252,7 @@ def render_runtime_panel() -> None:
 
     with st.expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-100:]:
+            for item in st.session_state.logs[-200:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -311,8 +321,12 @@ def deduplicate_companies(companies: List[Dict[str, str]]) -> List[Dict[str, str
     for company in companies:
         name = str(company.get("name", "")).strip()
         url = str(company.get("url", "")).strip()
+        manual_text = str(company.get("manual_text", "")).strip()
 
-        if not name or not url:
+        if not name:
+            continue
+
+        if not url and not manual_text:
             continue
 
         key = (name.lower(), url.lower())
@@ -320,7 +334,13 @@ def deduplicate_companies(companies: List[Dict[str, str]]) -> List[Dict[str, str
             continue
 
         seen.add(key)
-        result.append({"name": name, "url": url})
+        result.append(
+            {
+                "name": name,
+                "url": url,
+                "manual_text": manual_text,
+            }
+        )
 
     return result
 
@@ -449,81 +469,191 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def build_dataframe_from_records(
+    records: List[Dict[str, Any]],
+    params: List[str],
+) -> pd.DataFrame:
+    columns = ["Компания"] + params
+    df = pd.DataFrame(records)
+
+    for column in columns:
+        if column not in df.columns:
+            df[column] = "Не указано"
+
+    df = df[columns]
+    return df
+
+
 # =========================
 # PARSERS
 # =========================
 
 def fetch_text_requests(url: str) -> str:
+    session = requests.Session()
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.google.com/",
     }
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=REQUESTS_TIMEOUT,
-        allow_redirects=True,
-    )
+    last_error = None
 
-    response.raise_for_status()
+    for attempt in range(2):
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=REQUESTS_TIMEOUT,
+                allow_redirects=True,
+            )
 
-    soup = BeautifulSoup(response.text, "html.parser")
+            response.raise_for_status()
 
-    for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
-        tag.decompose()
+            soup = BeautifulSoup(response.text, "html.parser")
 
-    text = soup.get_text("\n")
-    text = clean_text(text)
+            for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
+                tag.decompose()
 
-    return text
+            text = soup.get_text("\n")
+            text = clean_text(text)
+
+            return text
+
+        except Exception as exc:
+            last_error = exc
+            log(f"requests attempt {attempt + 1}/2 failed for {url}: {repr(exc)}")
+            time.sleep(1)
+
+    raise last_error
 
 
 def fetch_text_playwright(url: str) -> str:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-setuid-sandbox",
-            ],
-        )
+    browser = None
+    context = None
 
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="ru-RU",
-            viewport={"width": 1440, "height": 1200},
-        )
+    try:
+        log(f"Playwright: запускаю браузер для {url}")
 
-        page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
 
+            log(f"Playwright: браузер запущен для {url}")
+
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                locale="ru-RU",
+                viewport={"width": 1440, "height": 1200},
+                extra_http_headers={
+                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                },
+            )
+
+            page = context.new_page()
+            page.set_default_timeout(10000)
+            page.set_default_navigation_timeout(PLAYWRIGHT_TIMEOUT)
+
+            log(f"Playwright: открываю страницу {url}")
+
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=PLAYWRIGHT_TIMEOUT,
+            )
+
+            log(f"Playwright: DOM загружен для {url}")
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+                log(f"Playwright: networkidle получен для {url}")
+            except Exception:
+                log(f"Playwright: networkidle не дождались, продолжаю для {url}")
+
+            page.wait_for_timeout(2000)
+
+            title = ""
+            current_url = ""
+
+            try:
+                title = page.title()
+            except Exception:
+                title = ""
+
+            try:
+                current_url = page.url
+            except Exception:
+                current_url = ""
+
+            log(f"Playwright: title='{title}', current_url='{current_url}'")
+
+            text = page.locator("body").inner_text(timeout=8000)
+            text = clean_text(text)
+
+            log(f"Playwright: получено символов: {len(text)} для {url}")
+
+            if not text:
+                raise RuntimeError(
+                    f"Playwright открыл страницу, но body пустой. "
+                    f"Title: {title}. Current URL: {current_url}"
+                )
+
+            if len(text) < 300:
+                raise RuntimeError(
+                    f"Playwright получил слишком мало текста: {len(text)} символов. "
+                    f"Title: {title}. Current URL: {current_url}. "
+                    f"Текст: {text[:500]}"
+                )
+
+            return text
+
+    except Exception as exc:
+        error_text = str(exc)
+
+        if "Executable doesn't exist" in error_text or "playwright install" in error_text:
+            raise RuntimeError(
+                "Playwright установлен, но браузер Chromium не скачан. "
+                "В Render добавьте build.sh с командой: "
+                "PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium. "
+                "После этого выполните Manual Deploy → Clear build cache & deploy."
+            ) from exc
+
+        raise
+
+    finally:
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)
+            if context is not None:
+                context.close()
         except Exception:
             pass
 
         try:
-            page.wait_for_timeout(3000)
+            if browser is not None:
+                browser.close()
         except Exception:
             pass
-
-        text = page.locator("body").inner_text(timeout=15000)
-
-        context.close()
-        browser.close()
-
-        return clean_text(text)
 
 
 def get_page_text(url: str, company_name: str) -> Dict[str, Any]:
@@ -546,7 +676,9 @@ def get_page_text(url: str, company_name: str) -> Dict[str, Any]:
             return result
 
         log(f"{company_name}: requests вернул слишком мало текста: {len(text)} символов")
+
     except Exception as exc:
+        result["error"] = repr(exc)
         log(f"{company_name}: requests ошибка: {repr(exc)}")
 
     try:
@@ -568,9 +700,38 @@ def get_page_text(url: str, company_name: str) -> Dict[str, Any]:
         return result
 
     except Exception as exc:
-        result["error"] = traceback.format_exc()
+        previous_error = result.get("error", "")
+        result["error"] = f"requests error: {previous_error}; playwright error: {repr(exc)}"
         log(f"{company_name}: Playwright ошибка: {repr(exc)}")
         return result
+
+
+def is_probable_blocking_error(error_text: str) -> bool:
+    if not error_text:
+        return False
+
+    lowered = error_text.lower()
+
+    blocking_markers = [
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "timeout",
+        "timed out",
+        "connecttimeout",
+        "readtimeout",
+        "captcha",
+        "access denied",
+        "blocked",
+        "too many requests",
+        "429",
+        "bot",
+        "antibot",
+        "cloudflare",
+    ]
+
+    return any(marker in lowered for marker in blocking_markers)
 
 
 # =========================
@@ -617,8 +778,17 @@ def build_extraction_prompt(
     url: str,
     source_text: str,
     params: List[str],
+    source_mode: str = "parsed",
 ) -> str:
     params_json = json.dumps(params, ensure_ascii=False, indent=2)
+
+    if source_mode == "manual":
+        source_note = (
+            "Текст страницы был вставлен пользователем вручную, потому что сайт "
+            "не отдал данные автоматическому парсеру."
+        )
+    else:
+        source_note = "Текст страницы был получен автоматическим парсером."
 
     return f"""
 Ты аналитик, который заполняет battle card / сравнительную таблицу по данным с сайта.
@@ -638,6 +808,9 @@ def build_extraction_prompt(
 URL источника:
 {url}
 
+Источник текста:
+{source_note}
+
 Параметры, которые нужно заполнить:
 {params_json}
 
@@ -652,6 +825,7 @@ URL источника:
 8. Для параметра "Статус парсинга" укажи одну из формулировок:
    - "Данные извлечены"
    - "Данные частично извлечены"
+   - "Данные извлечены из текста, вставленного вручную"
    - "На странице мало релевантной информации"
 9. Не добавляй ключи, которых нет в списке параметров.
 
@@ -712,6 +886,44 @@ def build_unification_prompt(
   ]
 }}
 """.strip()
+
+
+def extract_record_with_llm(
+    battle_card_name: str,
+    product_name: str,
+    company_name: str,
+    url: str,
+    source_text: str,
+    params: List[str],
+    source_mode: str,
+    parsing_status: str,
+) -> Dict[str, Any]:
+    trimmed_text = source_text[:MAX_SOURCE_CHARS]
+
+    prompt = build_extraction_prompt(
+        battle_card_name=battle_card_name,
+        product_name=product_name,
+        company_name=company_name,
+        url=url,
+        source_text=trimmed_text,
+        params=params,
+        source_mode=source_mode,
+    )
+
+    response_text = call_llm(prompt)
+    raw_record = extract_json_from_text(response_text)
+
+    normalized = normalize_record_to_schema(
+        raw_record=raw_record,
+        company_name=company_name,
+        url=url,
+        params=params,
+        parsing_status=parsing_status,
+    )
+
+    st.session_state.last_raw_records.append(raw_record)
+
+    return normalized
 
 
 def maybe_unify_records_with_llm(
@@ -794,6 +1006,65 @@ def maybe_unify_records_with_llm(
 # PIPELINE
 # =========================
 
+def make_blocked_placeholder_record(
+    company_name: str,
+    url: str,
+    params: List[str],
+    error_text: str,
+) -> Dict[str, Any]:
+    if is_probable_blocking_error(error_text):
+        status = (
+            "Сайт заблокировал парсер или не отдал страницу автоматически. "
+            "Нужно вставить текст страницы вручную."
+        )
+    else:
+        status = (
+            "Не удалось получить страницу автоматически. "
+            "Можно вставить текст страницы вручную."
+        )
+
+    record = normalize_record_to_schema(
+        raw_record={},
+        company_name=company_name,
+        url=url,
+        params=params,
+        parsing_status=status,
+    )
+
+    if "Что не указано на странице" in record:
+        record["Что не указано на странице"] = (
+            "Автоматический парсер не получил текст страницы. "
+            "Для извлечения данных нужно открыть сайт вручную, скопировать текст и вставить его в приложение."
+        )
+
+    return record
+
+
+def add_pending_manual_request(
+    company_name: str,
+    url: str,
+    error_text: str,
+) -> None:
+    existing_keys = {
+        (item.get("name", ""), item.get("url", ""))
+        for item in st.session_state.pending_manual_requests
+    }
+
+    key = (company_name, url)
+
+    if key in existing_keys:
+        return
+
+    st.session_state.pending_manual_requests.append(
+        {
+            "name": company_name,
+            "url": url,
+            "error": error_text,
+            "manual_text": "",
+        }
+    )
+
+
 def run_pipeline(
     battle_card_name: str,
     product_name: str,
@@ -807,12 +1078,22 @@ def run_pipeline(
     selected_companies = deduplicate_companies(selected_companies)
 
     if not selected_companies:
-        raise ValueError("Не указано ни одной компании со ссылкой.")
+        raise ValueError("Не указано ни одной компании со ссылкой или ручным текстом.")
 
     if not params:
         raise ValueError("Не указаны параметры сравнения.")
 
     st.session_state.total_companies = len(selected_companies)
+
+    st.session_state.pipeline_context = {
+        "battle_card_name": battle_card_name,
+        "product_name": product_name,
+        "params": params,
+        "use_unification": use_unification,
+    }
+
+    st.session_state.last_columns = ["Компания"] + params
+
     records = []
 
     update_runtime_ui(
@@ -825,9 +1106,49 @@ def run_pipeline(
 
     for index, company in enumerate(selected_companies):
         company_name = company["name"]
-        url = company["url"]
+        url = company.get("url", "")
+        manual_text = company.get("manual_text", "")
 
         base_progress = int((index / len(selected_companies)) * 90)
+
+        if manual_text:
+            update_runtime_ui(
+                status=f"Анализ: {company_name}",
+                step="LLM-извлечение из ручного текста",
+                company=company_name,
+                progress=base_progress,
+                user_message=f"Использую текст, вставленный вручную: {company_name}.",
+            )
+
+            try:
+                normalized = extract_record_with_llm(
+                    battle_card_name=battle_card_name,
+                    product_name=product_name,
+                    company_name=company_name,
+                    url=url,
+                    source_text=manual_text,
+                    params=params,
+                    source_mode="manual",
+                    parsing_status="Данные извлечены из текста, вставленного вручную",
+                )
+                records.append(normalized)
+                log(f"{company_name}: LLM-извлечение из ручного текста успешно.")
+
+            except Exception as exc:
+                log(f"{company_name}: ошибка LLM-извлечения из ручного текста: {repr(exc)}")
+                log(traceback.format_exc())
+
+                normalized = normalize_record_to_schema(
+                    raw_record={},
+                    company_name=company_name,
+                    url=url,
+                    params=params,
+                    parsing_status=f"Ошибка LLM-извлечения из ручного текста: {repr(exc)[:300]}",
+                )
+                records.append(normalized)
+
+            st.session_state.completed_companies += 1
+            continue
 
         update_runtime_ui(
             status=f"Анализ: {company_name}",
@@ -844,17 +1165,27 @@ def run_pipeline(
 
         if not source_text:
             log(f"{company_name}: текст страницы не получен.")
-            raw_record = {}
-            parsing_status = f"Ошибка парсинга: {parser_error[:300]}" if parser_error else "Ошибка парсинга"
 
-            normalized = normalize_record_to_schema(
-                raw_record=raw_record,
+            add_pending_manual_request(
+                company_name=company_name,
+                url=url,
+                error_text=parser_error,
+            )
+
+            placeholder = make_blocked_placeholder_record(
                 company_name=company_name,
                 url=url,
                 params=params,
-                parsing_status=parsing_status,
+                error_text=parser_error,
             )
-            records.append(normalized)
+
+            records.append(placeholder)
+
+            add_user_update(
+                f"Сайт {company_name} не отдал страницу парсеру. "
+                f"Нужно вставить текст вручную в блоке ниже."
+            )
+
             st.session_state.completed_companies += 1
             continue
 
@@ -867,34 +1198,22 @@ def run_pipeline(
         )
 
         try:
-            trimmed_text = source_text[:MAX_SOURCE_CHARS]
-
-            prompt = build_extraction_prompt(
-                battle_card_name=battle_card_name,
-                product_name=product_name,
-                company_name=company_name,
-                url=url,
-                source_text=trimmed_text,
-                params=params,
-            )
-
-            response_text = call_llm(prompt)
-            raw_record = extract_json_from_text(response_text)
-
             parsing_status = "Данные извлечены"
             if parser_status != "ОК":
                 parsing_status = f"Данные частично извлечены; статус парсинга: {parser_status}"
 
-            normalized = normalize_record_to_schema(
-                raw_record=raw_record,
+            normalized = extract_record_with_llm(
+                battle_card_name=battle_card_name,
+                product_name=product_name,
                 company_name=company_name,
                 url=url,
+                source_text=source_text,
                 params=params,
+                source_mode="parsed",
                 parsing_status=parsing_status,
             )
 
             records.append(normalized)
-            st.session_state.last_raw_records.append(raw_record)
 
             log(f"{company_name}: LLM-извлечение успешно.")
 
@@ -923,31 +1242,159 @@ def run_pipeline(
             user_message=f"Компания обработана: {company_name}.",
         )
 
+    st.session_state.base_records = records
+
+    if st.session_state.pending_manual_requests:
+        final_records = records
+        update_runtime_ui(
+            status="Часть сайтов не отдала текст парсеру",
+            step="Ожидается ручная вставка текста",
+            company="Сайты с блокировкой",
+            progress=90,
+            user_message="Для части сайтов нужно вручную вставить текст страницы.",
+        )
+    else:
+        final_records = maybe_unify_records_with_llm(
+            battle_card_name=battle_card_name,
+            product_name=product_name,
+            params=params,
+            records=records,
+            use_unification=use_unification,
+        )
+
+        update_runtime_ui(
+            status="Готово",
+            step="Завершено",
+            company="Все компании",
+            progress=100,
+            user_message="Таблица сформирована.",
+        )
+
+    df = build_dataframe_from_records(final_records, params)
+    st.session_state.last_df = df
+
+    return df
+
+
+def replace_records_with_manual_results(
+    base_records: List[Dict[str, Any]],
+    manual_records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    manual_by_company_url = {}
+
+    for record in manual_records:
+        company = str(record.get("Компания", "")).strip()
+        url = str(record.get("URL источника", "")).strip()
+        manual_by_company_url[(company, url)] = record
+
+    result = []
+
+    for record in base_records:
+        company = str(record.get("Компания", "")).strip()
+        url = str(record.get("URL источника", "")).strip()
+        key = (company, url)
+
+        if key in manual_by_company_url:
+            result.append(manual_by_company_url[key])
+        else:
+            result.append(record)
+
+    return result
+
+
+def process_manual_requests() -> Optional[pd.DataFrame]:
+    context = st.session_state.pipeline_context
+
+    if not context:
+        st.error("Нет контекста предыдущего запуска. Запустите сбор данных заново.")
+        return None
+
+    battle_card_name = context["battle_card_name"]
+    product_name = context["product_name"]
+    params = context["params"]
+    use_unification = context["use_unification"]
+
+    manual_records = []
+
+    update_runtime_ui(
+        status="Обработка вручную вставленного текста",
+        step="LLM-извлечение из ручного текста",
+        company="Сайты с блокировкой",
+        progress=90,
+        user_message="Начата обработка вручную вставленного текста.",
+    )
+
+    for item in st.session_state.pending_manual_requests:
+        company_name = item.get("name", "")
+        url = item.get("url", "")
+        manual_text = item.get("manual_text", "")
+
+        if not manual_text or len(manual_text.strip()) < 200:
+            add_user_update(
+                f"Для {company_name} текст не обработан: вставлено слишком мало текста."
+            )
+            continue
+
+        try:
+            update_runtime_ui(
+                status=f"Обработка ручного текста: {company_name}",
+                step="LLM-извлечение из ручного текста",
+                company=company_name,
+                progress=92,
+                user_message=f"Передаю вручную вставленный текст в LLM: {company_name}.",
+            )
+
+            normalized = extract_record_with_llm(
+                battle_card_name=battle_card_name,
+                product_name=product_name,
+                company_name=company_name,
+                url=url,
+                source_text=manual_text,
+                params=params,
+                source_mode="manual",
+                parsing_status="Данные извлечены из текста, вставленного вручную",
+            )
+
+            manual_records.append(normalized)
+            log(f"{company_name}: ручной текст успешно обработан через LLM.")
+
+        except Exception as exc:
+            log(f"{company_name}: ошибка обработки ручного текста: {repr(exc)}")
+            log(traceback.format_exc())
+
+            error_record = normalize_record_to_schema(
+                raw_record={},
+                company_name=company_name,
+                url=url,
+                params=params,
+                parsing_status=f"Ошибка обработки ручного текста: {repr(exc)[:300]}",
+            )
+            manual_records.append(error_record)
+
+    st.session_state.manual_records = manual_records
+
+    merged_records = replace_records_with_manual_results(
+        base_records=st.session_state.base_records,
+        manual_records=manual_records,
+    )
+
     final_records = maybe_unify_records_with_llm(
         battle_card_name=battle_card_name,
         product_name=product_name,
         params=params,
-        records=records,
+        records=merged_records,
         use_unification=use_unification,
     )
 
-    columns = ["Компания"] + params
-    df = pd.DataFrame(final_records)
-
-    for column in columns:
-        if column not in df.columns:
-            df[column] = "Не указано"
-
-    df = df[columns]
-
+    df = build_dataframe_from_records(final_records, params)
     st.session_state.last_df = df
 
     update_runtime_ui(
         status="Готово",
-        step="Завершено",
+        step="Завершено после ручной вставки",
         company="Все компании",
         progress=100,
-        user_message="Таблица сформирована.",
+        user_message="Таблица обновлена с учётом вручную вставленного текста.",
     )
 
     return df
@@ -958,7 +1405,7 @@ def run_pipeline(
 # =========================
 
 def add_company_row() -> None:
-    st.session_state.custom_companies.append({"name": "", "url": ""})
+    st.session_state.custom_companies.append({"name": "", "url": "", "manual_text": ""})
 
 
 def remove_empty_company_rows() -> None:
@@ -967,12 +1414,19 @@ def remove_empty_company_rows() -> None:
     for item in st.session_state.custom_companies:
         name = str(item.get("name", "")).strip()
         url = str(item.get("url", "")).strip()
+        manual_text = str(item.get("manual_text", "")).strip()
 
-        if name or url:
-            cleaned.append({"name": name, "url": url})
+        if name or url or manual_text:
+            cleaned.append(
+                {
+                    "name": name,
+                    "url": url,
+                    "manual_text": manual_text,
+                }
+            )
 
     if not cleaned:
-        cleaned = [{"name": "", "url": ""}]
+        cleaned = [{"name": "", "url": "", "manual_text": ""}]
 
     st.session_state.custom_companies = cleaned
 
@@ -993,6 +1447,8 @@ def render_custom_companies_editor() -> List[Dict[str, str]]:
     edited_companies = []
 
     for i, company in enumerate(st.session_state.custom_companies):
+        st.markdown(f"**Компания {i + 1}**")
+
         cols = st.columns([1, 3])
 
         with cols[0]:
@@ -1011,11 +1467,125 @@ def render_custom_companies_editor() -> List[Dict[str, str]]:
                 placeholder="https://...",
             )
 
-        edited_companies.append({"name": name.strip(), "url": url.strip()})
+        with st.expander(
+            f"Ручной текст для {name or 'компании ' + str(i + 1)}",
+            expanded=False,
+        ):
+            st.caption(
+                "Это поле можно заполнить заранее, если сайт точно блокирует парсеры. "
+                "Тогда приложение не будет парсить URL, а сразу передаст этот текст в LLM."
+            )
+            manual_text = st.text_area(
+                "Текст страницы вручную",
+                value=company.get("manual_text", ""),
+                key=f"custom_company_manual_text_{i}",
+                height=180,
+                placeholder="Откройте сайт, скопируйте текст страницы и вставьте сюда.",
+            )
+
+        edited_companies.append(
+            {
+                "name": name.strip(),
+                "url": url.strip(),
+                "manual_text": manual_text.strip(),
+            }
+        )
 
     st.session_state.custom_companies = edited_companies
 
     return deduplicate_companies(edited_companies)
+
+
+# =========================
+# UI: MANUAL FALLBACK BLOCK
+# =========================
+
+def render_manual_fallback_block() -> None:
+    pending = st.session_state.pending_manual_requests
+
+    if not pending:
+        return
+
+    st.divider()
+
+    st.error(
+        "Сайт заблокировал парсер. "
+        "Откройте сайт по ссылке, скопируйте текст и вставьте его сюда."
+    )
+
+    st.caption(
+        "После вставки текста нажмите кнопку обработки. "
+        "Приложение передаст этот текст в LLM вместо текста, который не удалось получить парсером."
+    )
+
+    updated_pending = []
+
+    for i, item in enumerate(pending):
+        company_name = item.get("name", "")
+        url = item.get("url", "")
+        error_text = item.get("error", "")
+
+        with st.container(border=True):
+            st.markdown(f"### {company_name}")
+
+            if url:
+                st.markdown(f"[Открыть сайт]({url})")
+
+            with st.expander("Техническая причина", expanded=False):
+                st.code(error_text or "Нет технической ошибки.")
+
+            manual_text = st.text_area(
+                "Откройте сайт по ссылке, скопируйте текст и вставьте сюда:",
+                value=item.get("manual_text", ""),
+                key=f"pending_manual_text_{i}_{company_name}",
+                height=260,
+                placeholder=(
+                    "Вставьте сюда текст страницы. "
+                    "Лучше копировать основной текст продукта: условия, тарифы, требования, ограничения, FAQ."
+                ),
+            )
+
+            updated_item = dict(item)
+            updated_item["manual_text"] = manual_text.strip()
+            updated_pending.append(updated_item)
+
+    st.session_state.pending_manual_requests = updated_pending
+
+    process_button = st.button(
+        "Обработать вставленный текст",
+        type="primary",
+        use_container_width=True,
+    )
+
+    if process_button:
+        df = process_manual_requests()
+
+        if df is not None:
+            st.success("Вручную вставленный текст обработан. Таблица обновлена.")
+            st.dataframe(df, use_container_width=True)
+
+            csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+            excel_bytes = dataframe_to_excel_bytes(df)
+
+            download_col1, download_col2 = st.columns(2)
+
+            with download_col1:
+                st.download_button(
+                    label="Скачать обновлённый CSV",
+                    data=csv_bytes,
+                    file_name="battle_card.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            with download_col2:
+                st.download_button(
+                    label="Скачать обновлённый Excel",
+                    data=excel_bytes,
+                    file_name="battle_card.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
 
 # =========================
@@ -1064,7 +1634,11 @@ if mode == "Быстрый":
     )
 
     selected_companies = [
-        company
+        {
+            "name": company["name"],
+            "url": company["url"],
+            "manual_text": "",
+        }
         for company in available_companies
         if company["name"] in selected_names
     ]
@@ -1144,7 +1718,14 @@ if run_button:
             use_unification=use_unification,
         )
 
-        st.success("Готово. Таблица сформирована.")
+        if st.session_state.pending_manual_requests:
+            st.warning(
+                "Таблица сформирована частично. "
+                "Для части сайтов нужно вручную вставить текст страницы."
+            )
+        else:
+            st.success("Готово. Таблица сформирована.")
+
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
@@ -1177,6 +1758,8 @@ if run_button:
 
         with st.expander("Подробности ошибки", expanded=True):
             st.code(traceback.format_exc())
+
+render_manual_fallback_block()
 
 if st.session_state.last_df is not None and not run_button:
     st.subheader("Последний результат")
