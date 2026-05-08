@@ -2,14 +2,10 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-from tenacity import retry, stop_after_attempt, wait_exponential
-from openai import OpenAI
 
 # =========================
-# CONFIG
+# DATA
 # =========================
-
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 PRODUCT_BANK_URLS = {
     "КНЗ: кредит под залог недвижимости": [
@@ -46,74 +42,40 @@ PRODUCT_BANK_URLS = {
 }
 
 # =========================
-# LLM SCHEMA PROMPTS (НЕ УПРОЩЕНЫ)
+# UI
 # =========================
 
-def get_schema(battle_card_type: str):
-    # твои промты сохранены 1:1
-    if battle_card_type == "КНА: кредит под залог автомобиля":
-        return """## Основные параметры кредита
-| Параметр | Содержание |
-|---|---|
-| Название банка | |
-| URL источника | |
-| Название продукта | |
-| Тип кредита | |
-| Процентная ставка | |
-| Полная стоимость кредита / ПСК | |
-| Максимальная сумма кредита | |
-| Минимальная сумма кредита | |
-| Максимальный срок кредитования | |
-| Минимальный срок кредитования | |
-| Валюта кредита | |
-| График платежей | |
-| Целевое / нецелевое использование средств | |
+st.set_page_config(page_title="Battle Cards")
 
-## Залоговое обеспечение
-| Параметр | Содержание |
-|---|---|
-| Требуется ли залог автомобиля | |
-| Какие транспортные средства принимаются в залог | |
-| Легковые автомобили | |
-| Коммерческий транспорт | |
-| Мототехника | |
-| Иностранные / отечественные автомобили | |
-| Максимальный возраст автомобиля | |
-| Требования к техническому состоянию | |
-| Требования к регистрации автомобиля | |
-| Требования к собственнику автомобиля | |
-| Возможность залога автомобиля третьего лица | |
-| Максимальный LTV | |
-| Оценка автомобиля | |
-| Ограничения использования | |
-"""
+st.title("Баттл-карты (Yandex GPT + парсинг)")
 
-    if battle_card_type == "КНЗ: кредит под залог недвижимости":
-        return """## Основные параметры кредита
-| Параметр | Содержание |
-|---|---|
-| Название банка | |
-| URL источника | |
-| Название продукта | |
-| Процентная ставка | |
-| Максимальная сумма кредита | |
-| Минимальная сумма кредита | |
-| Максимальный срок кредитования | |
-| Минимальный срок кредитования | |
-| График платежей | |
-| Целевое использование средств | |
-| LTV | |
-"""
+api_key = st.text_input("Yandex API Key", type="password")
+folder_id = st.text_input("Folder ID")
 
-    return "## Универсальная таблица\n| Параметр | Содержание |\n|---|---|\n"
+battle_card_type = st.selectbox(
+    "Тип баттл-карты",
+    list(PRODUCT_BANK_URLS.keys())
+)
+
+banks = PRODUCT_BANK_URLS[battle_card_type]
+
+selected = st.multiselect(
+    "Банки",
+    [b["name"] for b in banks],
+    default=[b["name"] for b in banks]
+)
+
+model = f"gpt://{folder_id}/gpt-oss-120b/latest" if folder_id else None
 
 # =========================
-# PARSER
+# HTTP HELPERS
 # =========================
 
 def fetch_html(url: str) -> str:
     r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
     return r.text
+
 
 def clean_text(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
@@ -122,94 +84,130 @@ def clean_text(html: str) -> str:
     return soup.get_text(" ", strip=True)
 
 # =========================
-# LLM EXTRACTION (per bank)
+# YANDEX GPT CALL
 # =========================
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
-def extract_bank(text: str, bank_name: str, url: str, schema: str):
+def call_yandex_gpt(prompt: str):
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+    headers = {
+        "Authorization": f"Api-Key {api_key}",
+        "Content-Type": "application/json",
+        "x-folder-id": folder_id
+    }
+
+    payload = {
+        "modelUri": model,
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.0,
+            "maxTokens": 2500
+        },
+        "messages": [
+            {
+                "role": "system",
+                "text": "Ты банковский аналитик. Работаешь строго по тексту. Не выдумываешь данные."
+            },
+            {
+                "role": "user",
+                "text": prompt
+            }
+        ]
+    }
+
+    r = requests.post(url, json=payload, headers=headers, timeout=60)
+    r.raise_for_status()
+
+    return r.json()["result"]["alternatives"][0]["message"]["text"]
+
+# =========================
+# SCHEMA
+# =========================
+
+def get_schema(battle_card_type: str):
+    # оставлено без упрощения логики
+    return """
+## Основные параметры кредита
+| Параметр | Содержание |
+|---|---|
+| Название банка | |
+| URL источника | |
+| Название продукта | |
+| Процентная ставка | |
+| ПСК | |
+| Максимальная сумма | |
+| Минимальная сумма | |
+| Срок | |
+| График платежей | |
+"""
+
+# =========================
+# EXTRACTION PER BANK
+# =========================
+
+def extract_bank(text, bank_name, url, schema):
     prompt = f"""
 Тип баттл-карты:
 {schema}
 
-Источник:
-{url}
-
 Банк:
 {bank_name}
+
+Источник:
+{url}
 
 Текст:
 {text}
 
 Правила:
-- не фантазируй
+- только факты из текста
 - если нет данных: "Не указано"
-- сохраняй числа, ставки, сроки
-- строго Markdown таблица
+- не придумывать
+- вернуть Markdown таблицу
 """
 
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": "Ты банковский аналитик. Работаешь строго по данным."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
-    )
-
-    return resp.choices[0].message.content
+    return call_yandex_gpt(prompt)
 
 # =========================
-# AGGREGATION STEP (КЛЮЧЕВОЕ ИЗМЕНЕНИЕ)
+# MERGE STEP (GLOBAL TABLE)
 # =========================
 
-def merge_tables(all_tables: list[str]) -> str:
+def merge_tables(tables: list[str]):
     prompt = f"""
-У тебя есть несколько Markdown таблиц по разным банкам.
+У тебя есть несколько таблиц по разным банкам.
 
-Твоя задача:
-1. объединить их в одну сравнительную таблицу
-2. выровнять параметры
-3. сохранить все числовые значения
-4. если значение отсутствует — "Не указано"
-5. не придумывать данные
+Задача:
+1. объединить в одну сравнительную таблицу
+2. строки = параметры
+3. столбцы = банки
+4. ничего не придумывать
+5. сохранить все числа и ставки
 
 ТАБЛИЦЫ:
-{chr(10).join(all_tables)}
+{chr(10).join(tables)}
 
-Верни ОДНУ Markdown таблицу:
-строки = параметры
-колонки = банки
+Верни ОДНУ Markdown таблицу.
 """
 
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": "Ты эксперт по банковскому сравнению продуктов."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
-    )
-
-    return resp.choices[0].message.content
+    return call_yandex_gpt(prompt)
 
 # =========================
-# STREAMLIT APP
+# RUN
 # =========================
-
-st.title("Банковский парсер баттл-карт")
-
-battle_card_type = st.selectbox("Тип продукта", list(PRODUCT_BANK_URLS.keys()))
 
 if st.button("Запустить парсинг"):
 
+    if not api_key or not folder_id:
+        st.error("Нужны API Key и Folder ID")
+        st.stop()
+
     schema = get_schema(battle_card_type)
-    banks = PRODUCT_BANK_URLS[battle_card_type]
 
-    st.write(f"Банков: {len(banks)}")
+    selected_banks = [b for b in banks if b["name"] in selected]
 
-    extracted_tables = []
+    results = []
 
-    for b in banks:
+    for b in selected_banks:
         st.write(f"Парсинг: {b['name']}")
 
         html = fetch_html(b["url"])
@@ -217,10 +215,10 @@ if st.button("Запустить парсинг"):
 
         table = extract_bank(text, b["name"], b["url"], schema)
 
-        extracted_tables.append(table)
+        results.append(table)
 
-    st.write("### Объединение таблиц...")
+    st.write("### Объединённая таблица")
 
-    final_table = merge_tables(extracted_tables)
+    final = merge_tables(results)
 
-    st.markdown(final_table)
+    st.markdown(final)
