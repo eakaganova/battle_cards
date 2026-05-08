@@ -126,9 +126,9 @@ YANDEX_MODEL = os.getenv("YANDEX_MODEL", "gpt-oss-120b/latest")
 
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 
-MAX_SOURCE_CHARS = 25000
+MAX_SOURCE_CHARS = 35000
 REQUESTS_TIMEOUT = 20
-PLAYWRIGHT_TIMEOUT = 45000
+PLAYWRIGHT_TIMEOUT = 60000
 
 
 # =========================
@@ -157,9 +157,9 @@ defaults = {
     "user_updates": [],
     "custom_params_text": "\n".join(DEFAULT_CUSTOM_PARAMS),
     "custom_companies": [
-        {"name": "", "url": ""},
-        {"name": "", "url": ""},
-        {"name": "", "url": ""},
+        {"name": "", "url": "", "manual_text": ""},
+        {"name": "", "url": "", "manual_text": ""},
+        {"name": "", "url": "", "manual_text": ""},
     ],
     "last_df": None,
     "last_raw_records": [],
@@ -223,9 +223,6 @@ def reset_runtime_state() -> None:
 # =========================
 
 def init_live_ui() -> Dict[str, Any]:
-    """
-    Создаёт контейнеры, которые обновляются прямо во время выполнения пайплайна.
-    """
     return {
         "status_box": st.empty(),
         "progress_bar": st.empty(),
@@ -247,9 +244,6 @@ def render_live_status(
     started_at: float,
     last_event: str = "",
 ) -> None:
-    """
-    Принудительно перерисовывает live-статус выполнения.
-    """
     elapsed = int(time.time() - started_at)
     minutes = elapsed // 60
     seconds = elapsed % 60
@@ -284,6 +278,8 @@ def render_live_status(
     steps = [
         "Подготовка списка компаний и параметров",
         "Парсинг страницы",
+        "Раскрытие скрытых блоков",
+        "Использование ручного текста",
         "Извлечение параметров через LLM",
         "Нормализация записи",
         "Компания обработана",
@@ -309,7 +305,7 @@ def render_live_status(
 
     with ui["log_box"].expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-80:]:
+            for item in st.session_state.logs[-100:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -408,16 +404,26 @@ def deduplicate_companies(companies: List[Dict[str, str]]) -> List[Dict[str, str
     for company in companies:
         name = str(company.get("name", "")).strip()
         url = str(company.get("url", "")).strip()
+        manual_text = str(company.get("manual_text", "")).strip()
 
-        if not name or not url:
+        if not name:
             continue
 
-        key = (name.lower(), url.lower())
+        if not url and not manual_text:
+            continue
+
+        key = (name.lower(), url.lower(), manual_text[:120].lower())
         if key in seen:
             continue
 
         seen.add(key)
-        result.append({"name": name, "url": url})
+        result.append(
+            {
+                "name": name,
+                "url": url,
+                "manual_text": manual_text,
+            }
+        )
 
     return result
 
@@ -491,7 +497,7 @@ def normalize_record_to_schema(
 
     for param in params:
         if param == "URL источника":
-            record[param] = url
+            record[param] = url if url else "Нет URL / использован ручной текст"
             continue
 
         if param == "Статус парсинга":
@@ -546,7 +552,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 # =========================
-# PARSERS
+# PARSERS: REQUESTS
 # =========================
 
 def fetch_text_requests(url: str) -> str:
@@ -581,6 +587,348 @@ def fetch_text_requests(url: str) -> str:
     return text
 
 
+# =========================
+# PARSERS: PLAYWRIGHT DEEP MODE
+# =========================
+
+def is_safe_expand_text(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.strip().lower()
+    t = re.sub(r"\s+", " ", t)
+
+    if len(t) > 220:
+        return False
+
+    safe_patterns = [
+        "показать еще",
+        "показать ещё",
+        "показать все",
+        "показать полностью",
+        "раскрыть",
+        "развернуть",
+        "подробнее",
+        "читать далее",
+        "ещё",
+        "еще",
+        "все условия",
+        "условия",
+        "тарифы",
+        "документы",
+        "требования",
+        "вопросы",
+        "ответы",
+        "faq",
+        "частые вопросы",
+        "как оформить",
+        "что входит",
+        "что покрывает",
+        "исключения",
+        "ограничения",
+        "преимущества",
+        "подробные условия",
+        "полные условия",
+        "описание",
+        "детали",
+        "смотреть все",
+        "смотреть ещё",
+        "смотреть еще",
+        "раздел",
+        "состав",
+        "покрытие",
+        "страховые случаи",
+        "не страховые случаи",
+        "памятка",
+        "правила",
+        "о продукте",
+    ]
+
+    unsafe_patterns = [
+        "оформить",
+        "купить",
+        "оплатить",
+        "заказать",
+        "оставить заявку",
+        "подать заявку",
+        "получить",
+        "войти",
+        "вход",
+        "личный кабинет",
+        "зарегистрироваться",
+        "продолжить",
+        "перейти к оплате",
+        "рассчитать",
+        "рассчитать стоимость",
+        "отправить",
+        "позвонить",
+        "консультация",
+        "оставьте телефон",
+        "оставить телефон",
+        "заполнить",
+        "выбрать",
+        "перейти",
+        "скачать приложение",
+        "открыть счет",
+        "открыть счёт",
+        "получить карту",
+    ]
+
+    if any(pattern in t for pattern in unsafe_patterns):
+        return False
+
+    return any(pattern in t for pattern in safe_patterns)
+
+
+def click_cookie_banners(page) -> int:
+    clicked = 0
+
+    selectors = [
+        "button:has-text('Принять')",
+        "button:has-text('Согласен')",
+        "button:has-text('Согласна')",
+        "button:has-text('Соглашаюсь')",
+        "button:has-text('Хорошо')",
+        "button:has-text('Понятно')",
+        "button:has-text('Ок')",
+        "button:has-text('OK')",
+        "button:has-text('Закрыть')",
+        "button:has-text('Не сейчас')",
+        "[aria-label='Close']",
+        "[aria-label='Закрыть']",
+        "[data-testid='close']",
+    ]
+
+    for selector in selectors:
+        try:
+            elements = page.locator(selector)
+            count = min(elements.count(), 5)
+
+            for i in range(count):
+                try:
+                    element = elements.nth(i)
+                    if element.is_visible(timeout=800):
+                        element.click(timeout=2000)
+                        clicked += 1
+                        page.wait_for_timeout(400)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return clicked
+
+
+def scroll_page_deeply(page, max_rounds: int = 8) -> None:
+    last_height = 0
+
+    for _ in range(max_rounds):
+        try:
+            current_height = page.evaluate("document.body.scrollHeight")
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(1000)
+
+            new_height = page.evaluate("document.body.scrollHeight")
+
+            if new_height == last_height and current_height == last_height:
+                break
+
+            last_height = new_height
+        except Exception:
+            break
+
+    try:
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(700)
+    except Exception:
+        pass
+
+
+def collect_visible_body_text(page) -> str:
+    try:
+        text = page.locator("body").inner_text(timeout=15000)
+        return clean_text(text)
+    except Exception:
+        return ""
+
+
+def get_element_label(element) -> str:
+    parts = []
+
+    try:
+        inner_text = element.inner_text(timeout=700)
+        if inner_text:
+            parts.append(inner_text)
+    except Exception:
+        pass
+
+    for attr in ["aria-label", "title", "data-testid", "class"]:
+        try:
+            value = element.get_attribute(attr)
+            if value:
+                parts.append(value)
+        except Exception:
+            pass
+
+    label = " ".join(parts)
+    label = clean_text(label)
+    return label[:220]
+
+
+def click_safe_expandable_elements(page, max_clicks: int = 100) -> List[str]:
+    clicked_labels = []
+    clicked_fingerprints = set()
+
+    selectors = [
+        "button",
+        "a",
+        "[role='button']",
+        "summary",
+        "[aria-expanded='false']",
+        "[data-testid*='accordion']",
+        "[class*='accordion']",
+        "[class*='Accordion']",
+        "[class*='faq']",
+        "[class*='Faq']",
+        "[class*='spoiler']",
+        "[class*='Spoiler']",
+        "[class*='collapse']",
+        "[class*='Collapse']",
+        "[class*='tab']",
+        "[class*='Tab']",
+    ]
+
+    for selector in selectors:
+        try:
+            elements = page.locator(selector)
+            count = min(elements.count(), 250)
+
+            for i in range(count):
+                if len(clicked_labels) >= max_clicks:
+                    return clicked_labels
+
+                try:
+                    element = elements.nth(i)
+
+                    try:
+                        if not element.is_visible(timeout=700):
+                            continue
+                    except Exception:
+                        continue
+
+                    combined_label = get_element_label(element)
+
+                    if not combined_label:
+                        continue
+
+                    if not is_safe_expand_text(combined_label):
+                        continue
+
+                    fingerprint = f"{selector}|{i}|{combined_label.lower()[:160]}"
+                    if fingerprint in clicked_fingerprints:
+                        continue
+
+                    clicked_fingerprints.add(fingerprint)
+
+                    try:
+                        element.scroll_into_view_if_needed(timeout=2000)
+                        page.wait_for_timeout(300)
+                    except Exception:
+                        pass
+
+                    try:
+                        element.click(timeout=3000, force=False)
+                    except Exception:
+                        try:
+                            element.click(timeout=3000, force=True)
+                        except Exception:
+                            continue
+
+                    clicked_labels.append(combined_label[:180])
+                    page.wait_for_timeout(700)
+
+                except Exception:
+                    continue
+
+        except Exception:
+            continue
+
+    return clicked_labels
+
+
+def extract_document_links(page, base_url: str) -> List[str]:
+    links = []
+
+    try:
+        anchors = page.locator("a")
+        count = min(anchors.count(), 800)
+
+        origin = ""
+        origin_match = re.match(r"^(https?://[^/]+)", base_url)
+        if origin_match:
+            origin = origin_match.group(1)
+
+        for i in range(count):
+            try:
+                anchor = anchors.nth(i)
+                href = anchor.get_attribute("href") or ""
+
+                text = ""
+                try:
+                    text = anchor.inner_text(timeout=500)
+                except Exception:
+                    pass
+
+                href_l = href.lower()
+                text_l = text.lower()
+
+                is_relevant = (
+                    ".pdf" in href_l
+                    or ".doc" in href_l
+                    or ".docx" in href_l
+                    or ".xls" in href_l
+                    or ".xlsx" in href_l
+                    or "document" in href_l
+                    or "docs" in href_l
+                    or "upload" in href_l
+                    or "file" in href_l
+                    or "files" in href_l
+                    or "услов" in text_l
+                    or "тариф" in text_l
+                    or "правил" in text_l
+                    or "документ" in text_l
+                    or "памят" in text_l
+                    or "pdf" in text_l
+                    or "договор" in text_l
+                    or "полис" in text_l
+                    or "заявление" in text_l
+                    or "регламент" in text_l
+                )
+
+                if not is_relevant:
+                    continue
+
+                if href.startswith("//"):
+                    href = "https:" + href
+                elif href.startswith("/") and origin:
+                    href = origin + href
+
+                if href.startswith("http") and href not in links:
+                    label = clean_text(text)
+                    if label:
+                        links.append(f"{label}: {href}")
+                    else:
+                        links.append(href)
+
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    return links
+
+
 def fetch_text_playwright(url: str) -> str:
     try:
         with sync_playwright() as p:
@@ -601,28 +949,74 @@ def fetch_text_playwright(url: str) -> str:
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
                 locale="ru-RU",
-                viewport={"width": 1440, "height": 1200},
+                viewport={"width": 1440, "height": 1600},
+                java_script_enabled=True,
             )
 
             page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
+
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=PLAYWRIGHT_TIMEOUT,
+            )
 
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
                 pass
 
-            try:
-                page.wait_for_timeout(3000)
-            except Exception:
-                pass
+            page.wait_for_timeout(2000)
 
-            text = page.locator("body").inner_text(timeout=15000)
+            cookies_clicked = click_cookie_banners(page)
+
+            scroll_page_deeply(page, max_rounds=8)
+            initial_text = collect_visible_body_text(page)
+
+            clicked_labels_round_1 = click_safe_expandable_elements(page, max_clicks=70)
+
+            scroll_page_deeply(page, max_rounds=6)
+            clicked_labels_round_2 = click_safe_expandable_elements(page, max_clicks=50)
+
+            scroll_page_deeply(page, max_rounds=4)
+            clicked_labels_round_3 = click_safe_expandable_elements(page, max_clicks=30)
+
+            final_text = collect_visible_body_text(page)
+            document_links = extract_document_links(page, url)
 
             context.close()
             browser.close()
 
-            return clean_text(text)
+            clicked_labels = clicked_labels_round_1 + clicked_labels_round_2 + clicked_labels_round_3
+
+            parts = []
+
+            parts.append("=== МЕТАДАННЫЕ ПАРСИНГА ===")
+            parts.append(f"URL: {url}")
+            parts.append(f"Cookie/pop-up закрыто: {cookies_clicked}")
+            parts.append(f"Раскрытых элементов: {len(clicked_labels)}")
+            parts.append(f"Найденных ссылок на документы / условия: {len(document_links)}")
+
+            if initial_text:
+                parts.append("\n=== ТЕКСТ ДО РАСКРЫТИЯ БЛОКОВ ===")
+                parts.append(initial_text)
+
+            if clicked_labels:
+                parts.append("\n=== РАСКРЫТЫЕ ЭЛЕМЕНТЫ ===")
+                for label in clicked_labels:
+                    parts.append(f"- {label}")
+
+            if final_text:
+                parts.append("\n=== ТЕКСТ ПОСЛЕ РАСКРЫТИЯ БЛОКОВ ===")
+                parts.append(final_text)
+
+            if document_links:
+                parts.append("\n=== НАЙДЕННЫЕ ССЫЛКИ НА ДОКУМЕНТЫ / УСЛОВИЯ ===")
+                for link in document_links:
+                    parts.append(link)
+
+            combined_text = "\n".join(parts)
+            return clean_text(combined_text)
 
     except Exception as exc:
         error_text = str(exc)
@@ -688,26 +1082,26 @@ def get_page_text(
             render_live_status(
                 ui=live_ui,
                 status=f"Анализ: {company_name}",
-                step="Парсинг страницы",
+                step="Раскрытие скрытых блоков",
                 company=company_name,
                 progress=st.session_state.progress_value,
                 completed=st.session_state.completed_companies,
                 total=st.session_state.total_companies,
                 started_at=started_at,
-                last_event=f"{company_name}: requests не сработал, пробую Playwright.",
+                last_event=f"{company_name}: requests не сработал или дал мало текста. Пробую Playwright с раскрытием блоков.",
             )
 
         text = fetch_text_playwright(url)
 
         if len(text) >= 300:
             result["text"] = text
-            result["method"] = "playwright"
+            result["method"] = "playwright_deep"
             result["status"] = "ОК"
             log(f"{company_name}: Playwright успешно, символов: {len(text)}")
             return result
 
         result["text"] = text
-        result["method"] = "playwright"
+        result["method"] = "playwright_deep"
         result["status"] = "Мало текста"
         result["error"] = f"Получено мало текста: {len(text)} символов."
         log(f"{company_name}: Playwright вернул мало текста: {len(text)} символов")
@@ -767,10 +1161,10 @@ def build_extraction_prompt(
     params_json = json.dumps(params, ensure_ascii=False, indent=2)
 
     return f"""
-Ты аналитик, который заполняет battle card / сравнительную таблицу по данным с сайта.
+Ты аналитик, который заполняет battle card / сравнительную таблицу по данным с сайта или из ручного текста пользователя.
 
 Задача:
-Нужно извлечь из текста страницы информацию о продукте / сервисе / предложении компании и заполнить значения строго по заданным параметрам.
+Нужно извлечь информацию о продукте / сервисе / предложении компании и заполнить значения строго по заданным параметрам.
 
 Название баттл-карты:
 {battle_card_name}
@@ -782,7 +1176,7 @@ def build_extraction_prompt(
 {company_name}
 
 URL источника:
-{url}
+{url if url else "URL не указан / использован ручной текст"}
 
 Параметры, которые нужно заполнить:
 {params_json}
@@ -790,18 +1184,29 @@ URL источника:
 Правила:
 1. Верни только валидный JSON-объект. Никакого Markdown, пояснений и текста вокруг JSON.
 2. Ключи JSON должны точно совпадать с названиями параметров из списка.
-3. Если на странице нет данных по параметру, укажи "Не указано".
-4. Не выдумывай значения.
-5. Если значение найдено, формулируй кратко, но так, чтобы смысл был понятен.
-6. Если данные противоречивы, напиши: "На странице указано противоречиво: ..." и кратко поясни.
-7. Для параметра "Что не указано на странице" перечисли важные отсутствующие сведения из заданных параметров.
-8. Для параметра "Статус парсинга" укажи одну из формулировок:
+3. Используй весь предоставленный текст, включая разделы:
+   - метаданные парсинга;
+   - текст до раскрытия блоков;
+   - раскрытые элементы;
+   - текст после раскрытия блоков;
+   - найденные ссылки на документы / условия;
+   - ручной текст пользователя, если он был использован.
+4. Если текст получен вручную от пользователя, обрабатывай его так же, как текст страницы. Не добавляй факты вне предоставленного текста.
+5. Если на странице есть ссылка на документ, PDF, правила, тарифы или подробные условия, но сам текст документа не был извлечён, укажи это в релевантных параметрах.
+6. Если на странице или в ручном тексте нет данных по параметру, укажи "Не указано".
+7. Не выдумывай значения.
+8. Если значение найдено, формулируй кратко, но так, чтобы смысл был понятен.
+9. Если данные противоречивы, напиши: "На странице указано противоречиво: ..." и кратко поясни.
+10. Для параметра "Что не указано на странице" перечисли важные отсутствующие сведения из заданных параметров.
+11. Для параметра "Статус парсинга" укажи одну из формулировок:
    - "Данные извлечены"
    - "Данные частично извлечены"
    - "На странице мало релевантной информации"
-9. Не добавляй ключи, которых нет в списке параметров.
+   - "Использован ручной текст"
+12. Не добавляй ключи, которых нет в списке параметров.
+13. Не используй знания вне предоставленного текста. Если факта нет в тексте, пиши "Не указано".
 
-Текст страницы:
+Текст для анализа:
 {source_text}
 """.strip()
 
@@ -844,7 +1249,7 @@ def build_unification_prompt(
 6. Не меняй факты.
 7. Не выдумывай отсутствующие данные.
 8. Если данных нет, оставь "Не указано".
-9. Сохрани URL источника.
+9. Сохрани URL источника или значение "Нет URL / использован ручной текст".
 10. Унифицируй только стиль и формат записи: например, суммы, сроки, краткость описаний.
 
 Верни JSON строго такого вида:
@@ -994,7 +1399,7 @@ def run_pipeline(
     selected_companies = deduplicate_companies(selected_companies)
 
     if not selected_companies:
-        raise ValueError("Не указано ни одной компании со ссылкой.")
+        raise ValueError("Не указано ни одной компании со ссылкой или ручным текстом.")
 
     if not params:
         raise ValueError("Не указаны параметры сравнения.")
@@ -1023,7 +1428,8 @@ def run_pipeline(
 
     for index, company in enumerate(selected_companies):
         company_name = company["name"]
-        url = company["url"]
+        url = str(company.get("url", "")).strip()
+        manual_text = str(company.get("manual_text", "")).strip()
 
         base_progress = int((index / len(selected_companies)) * 90)
 
@@ -1037,24 +1443,60 @@ def run_pipeline(
                 completed=st.session_state.completed_companies,
                 total=st.session_state.total_companies,
                 started_at=started_at,
-                last_event=f"Начинаю парсинг страницы: {url}",
+                last_event=(
+                    f"Начинаю обработку: {company_name}. "
+                    f"URL: {url if url else 'не указан'}. "
+                    f"Ручной текст: {'есть' if manual_text else 'нет'}."
+                ),
             )
 
-        page_result = get_page_text(
-            url=url,
-            company_name=company_name,
-            live_ui=live_ui,
-            started_at=started_at,
-        )
+        page_result = {
+            "text": "",
+            "method": "",
+            "status": "Нет URL",
+            "error": "",
+        }
+
+        if url:
+            page_result = get_page_text(
+                url=url,
+                company_name=company_name,
+                live_ui=live_ui,
+                started_at=started_at,
+            )
+        else:
+            log(f"{company_name}: URL не указан, проверяю ручной текст.")
 
         source_text = page_result.get("text", "")
         parser_status = page_result.get("status", "Ошибка парсинга")
         parser_error = page_result.get("error", "")
 
+        if not source_text and manual_text:
+            source_text = clean_text(manual_text)
+            parser_status = "Использован ручной текст"
+            page_result["method"] = "manual_text"
+            page_result["status"] = parser_status
+            page_result["text"] = source_text
+
+            log(f"{company_name}: использован ручной текст, символов: {len(source_text)}")
+
+            if live_ui:
+                render_live_status(
+                    ui=live_ui,
+                    status=f"Анализ: {company_name}",
+                    step="Использование ручного текста",
+                    company=company_name,
+                    progress=min(base_progress + 10, 90),
+                    completed=st.session_state.completed_companies,
+                    total=st.session_state.total_companies,
+                    started_at=started_at,
+                    last_event=f"{company_name}: использую ручной текст пользователя. Символов: {len(source_text)}.",
+                )
+
         if not source_text:
-            log(f"{company_name}: текст страницы не получен.")
+            log(f"{company_name}: текст страницы не получен и ручной текст не указан.")
             raw_record = {}
-            parsing_status = f"Ошибка парсинга: {parser_error[:300]}" if parser_error else "Ошибка парсинга"
+            parsing_status = f"Ошибка парсинга: {parser_error[:300]}" if parser_error else "Ошибка парсинга: нет текста страницы и нет ручного текста"
 
             normalized = normalize_record_to_schema(
                 raw_record=raw_record,
@@ -1076,7 +1518,7 @@ def run_pipeline(
                     completed=st.session_state.completed_companies,
                     total=st.session_state.total_companies,
                     started_at=started_at,
-                    last_event=f"{company_name}: текст страницы не получен, запись добавлена со статусом ошибки.",
+                    last_event=f"{company_name}: текст не получен ни через сайт, ни вручную. Запись добавлена со статусом ошибки.",
                 )
 
             continue
@@ -1087,15 +1529,26 @@ def run_pipeline(
                 status=f"Анализ: {company_name}",
                 step="Извлечение параметров через LLM",
                 company=company_name,
-                progress=min(base_progress + 10, 90),
+                progress=min(base_progress + 20, 90),
                 completed=st.session_state.completed_companies,
                 total=st.session_state.total_companies,
                 started_at=started_at,
-                last_event=f"{company_name}: текст страницы получен. Символов: {len(source_text)}. Запускаю LLM.",
+                last_event=(
+                    f"{company_name}: текст получен методом {page_result.get('method', 'unknown')}. "
+                    f"Символов: {len(source_text)}. Запускаю LLM."
+                ),
             )
 
         try:
             trimmed_text = source_text[:MAX_SOURCE_CHARS]
+
+            if page_result.get("method") == "manual_text":
+                trimmed_text = (
+                    "=== РУЧНОЙ ТЕКСТ ПОЛЬЗОВАТЕЛЯ ===\n"
+                    f"Компания: {company_name}\n"
+                    f"URL: {url if url else 'URL не указан'}\n\n"
+                    f"{trimmed_text}"
+                )
 
             prompt = build_extraction_prompt(
                 battle_card_name=battle_card_name,
@@ -1115,16 +1568,19 @@ def run_pipeline(
                     status=f"Анализ: {company_name}",
                     step="Нормализация записи",
                     company=company_name,
-                    progress=min(base_progress + 20, 90),
+                    progress=min(base_progress + 30, 90),
                     completed=st.session_state.completed_companies,
                     total=st.session_state.total_companies,
                     started_at=started_at,
                     last_event=f"{company_name}: LLM вернула JSON, нормализую запись под заданную схему.",
                 )
 
-            parsing_status = "Данные извлечены"
-            if parser_status != "ОК":
-                parsing_status = f"Данные частично извлечены; статус парсинга: {parser_status}"
+            if parser_status == "Использован ручной текст":
+                parsing_status = "Использован ручной текст"
+            else:
+                parsing_status = "Данные извлечены"
+                if parser_status != "ОК":
+                    parsing_status = f"Данные частично извлечены; статус парсинга: {parser_status}"
 
             normalized = normalize_record_to_schema(
                 raw_record=raw_record,
@@ -1160,7 +1616,7 @@ def run_pipeline(
                     status=f"Ошибка LLM-извлечения: {company_name}",
                     step="Нормализация записи",
                     company=company_name,
-                    progress=min(base_progress + 20, 90),
+                    progress=min(base_progress + 30, 90),
                     completed=st.session_state.completed_companies,
                     total=st.session_state.total_companies,
                     started_at=started_at,
@@ -1224,7 +1680,13 @@ def run_pipeline(
 # =========================
 
 def add_company_row() -> None:
-    st.session_state.custom_companies.append({"name": "", "url": ""})
+    st.session_state.custom_companies.append(
+        {
+            "name": "",
+            "url": "",
+            "manual_text": "",
+        }
+    )
 
 
 def remove_empty_company_rows() -> None:
@@ -1233,18 +1695,28 @@ def remove_empty_company_rows() -> None:
     for item in st.session_state.custom_companies:
         name = str(item.get("name", "")).strip()
         url = str(item.get("url", "")).strip()
+        manual_text = str(item.get("manual_text", "")).strip()
 
-        if name or url:
-            cleaned.append({"name": name, "url": url})
+        if name or url or manual_text:
+            cleaned.append(
+                {
+                    "name": name,
+                    "url": url,
+                    "manual_text": manual_text,
+                }
+            )
 
     if not cleaned:
-        cleaned = [{"name": "", "url": ""}]
+        cleaned = [{"name": "", "url": "", "manual_text": ""}]
 
     st.session_state.custom_companies = cleaned
 
 
 def render_custom_companies_editor() -> List[Dict[str, str]]:
-    st.write("Укажите компании / продукты и ссылки на страницы, откуда нужно собрать данные.")
+    st.write(
+        "Укажите компании / продукты и ссылки на страницы. "
+        "Если сайт не парсится или условия лежат в PDF/документе, можно вставить текст вручную."
+    )
 
     col_a, col_b = st.columns([1, 1])
 
@@ -1259,6 +1731,8 @@ def render_custom_companies_editor() -> List[Dict[str, str]]:
     edited_companies = []
 
     for i, company in enumerate(st.session_state.custom_companies):
+        st.markdown(f"#### Компания {i + 1}")
+
         cols = st.columns([1, 3])
 
         with cols[0]:
@@ -1277,7 +1751,27 @@ def render_custom_companies_editor() -> List[Dict[str, str]]:
                 placeholder="https://...",
             )
 
-        edited_companies.append({"name": name.strip(), "url": url.strip()})
+        manual_text = st.text_area(
+            "Текст вручную, если страница не спарсилась или если нужно добавить условия из PDF / документа",
+            value=company.get("manual_text", ""),
+            key=f"custom_company_manual_text_{i}",
+            height=180,
+            placeholder=(
+                "Можно вставить сюда текст со страницы, из PDF, правил, тарифов, условий, FAQ или других документов. "
+                "Если парсер не сможет получить текст по ссылке, приложение использует этот текст. "
+                "Можно также оставить ссылку пустой и работать только с ручным текстом."
+            ),
+        )
+
+        edited_companies.append(
+            {
+                "name": name.strip(),
+                "url": url.strip(),
+                "manual_text": manual_text.strip(),
+            }
+        )
+
+        st.divider()
 
     st.session_state.custom_companies = edited_companies
 
@@ -1298,7 +1792,9 @@ if client is None:
 
 st.caption(
     "Парсинг одной страницы может занимать от нескольких секунд до минуты. "
-    "Если сайт защищён от обычного запроса или долго отвечает, приложение сначала пробует requests, затем Playwright."
+    "Если сайт защищён от обычного запроса или долго отвечает, приложение сначала пробует requests, "
+    "затем Playwright: скроллит страницу, раскрывает безопасные аккордеоны/FAQ/табы и собирает ссылки на документы. "
+    "Если сайт не спарсился, в расширенном режиме можно вставить текст вручную."
 )
 
 mode = st.radio(
@@ -1335,7 +1831,11 @@ if mode == "Быстрый":
     )
 
     selected_companies = [
-        company
+        {
+            "name": company["name"],
+            "url": company["url"],
+            "manual_text": "",
+        }
         for company in available_companies
         if company["name"] in selected_names
     ]
@@ -1378,7 +1878,7 @@ else:
         for param in params:
             st.write(f"• {param}")
 
-    st.markdown("#### Компании и ссылки")
+    st.markdown("#### Компании, ссылки и ручной текст")
 
     selected_companies = render_custom_companies_editor()
 
