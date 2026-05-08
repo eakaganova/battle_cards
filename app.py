@@ -5,17 +5,26 @@ from openai import OpenAI
 
 URL = "https://www.tbank.ru/travel/"
 
-st.title("Парсер + LLM (MVP)")
+st.set_page_config(page_title="Parser + LLM")
+
+st.title("Парсер + LLM анализ")
+
+st.write("Собирает текст со страницы и отправляет в LLM")
+
 
 # -----------------------
 # INPUT
 # -----------------------
 
-api_key = st.text_input("Yandex API Key", type="password")
+api_key = st.text_input("API Key (Yandex Cloud)", type="password")
 folder_id = st.text_input("Folder ID")
 
-MODEL = "gpt://b1gd45ibb82t3i8g80fn/gpt-oss-120b/latest"
+model = f"gpt://{folder_id}/gpt-oss-120b/latest" if folder_id else ""
 
+
+# -----------------------
+# CLIENT
+# -----------------------
 
 def get_client(api_key: str, folder_id: str):
     return OpenAI(
@@ -26,90 +35,103 @@ def get_client(api_key: str, folder_id: str):
 
 
 # -----------------------
-# PARSER
+# SAFE LLM PARSE
 # -----------------------
 
-def parse_page(url: str) -> str:
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+def extract_text(response) -> str:
+    """
+    Безопасное извлечение текста из Yandex/OpenAI Responses API
+    """
+    try:
+        # основной вариант
+        return response.output[0].content[0].text
+    except Exception:
+        pass
 
-    # важно для твоей ошибки с кракозябрами
-    r.encoding = "utf-8"
+    try:
+        # fallback 1
+        return response.output_text
+    except Exception:
+        pass
+
+    try:
+        # fallback 2 — полный dump
+        return str(response.output)
+    except Exception:
+        return "Не удалось извлечь ответ LLM"
+
+
+# -----------------------
+# SCRAPER
+# -----------------------
+
+def scrape_text(url: str) -> str:
+    r = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20
+    )
+
+    # фикс кракозябр
+    r.encoding = r.apparent_encoding
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # убираем мусорные теги
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-
     text = soup.get_text(" ", strip=True)
 
-    return text
-
-
-# -----------------------
-# LLM PROMPT (1 штука)
-# -----------------------
-
-PROMPT = """
-Ты аналитик цифровых продуктов.
-
-Тебе дан текст страницы сервиса.
-
-Задача:
-1. Определи, что это за сервис
-2. Выдели ключевые функции
-3. Сформируй таблицу
-
-Формат таблицы строго:
-
-| Параметр | Значение |
-|---|---|
-| Сервис | |
-| Основное назначение | |
-| Ключевые функции | |
-| Целевая аудитория | |
-| Основные сценарии использования | |
-
-Если данных нет — пиши "Не указано".
-Не добавляй лишний текст.
-"""
+    return text[:3000]
 
 
 # -----------------------
 # RUN
 # -----------------------
 
-if st.button("Запуск"):
+if st.button("Запустить"):
 
     if not api_key or not folder_id:
-        st.error("Введите API key и folder_id")
+        st.error("Нужны API key и folder_id")
         st.stop()
 
-    # 1. Парсинг
-    st.subheader("1. Парсинг страницы")
+    if not model:
+        st.error("folder_id пустой → модель не собрана")
+        st.stop()
 
-    text = parse_page(URL)
+    try:
+        st.subheader("1. Парсинг сайта")
 
-    st.write("Сырый текст (обрезка):")
-    st.code(text[:500])
+        text = scrape_text(URL)
 
-    # ограничиваем LLM
-    text = text[:6000]
+        st.code(text[:300])
 
-    # 2. LLM
-    st.subheader("2. LLM анализ")
+        st.subheader("2. Отправка в LLM")
 
-    client = get_client(api_key, folder_id)
+        client = get_client(api_key, folder_id)
 
-    response = client.responses.create(
-        model=MODEL,
-        temperature=0.2,
-        max_output_tokens=800,
-        instructions=PROMPT,
-        input=text
-    )
+        prompt = """
+Ты аналитик продукта.
 
-    result = response.output[0].content[0].text
+На основе текста:
+1. Определи, что это за сервис
+2. Перечисли 5 ключевых функций
+3. Кратко опиши ценность
 
-    st.subheader("Результат")
-    st.markdown(result)
+Верни результат в виде таблицы:
+| Пункт | Ответ |
+"""
+
+        response = client.responses.create(
+            model=model,
+            temperature=0.3,
+            max_output_tokens=500,
+            instructions=prompt,
+            input=text
+        )
+
+        result = extract_text(response)
+
+        st.subheader("Результат LLM")
+        st.write(result)
+
+    except Exception as e:
+        st.error("Ошибка выполнения")
+        st.exception(e)
