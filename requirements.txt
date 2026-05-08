@@ -1,4 +1,6 @@
-streamlit
-requests
-beautifulsoup4
-openai
+streamlit==1.37.0
+openai>=1.40.0
+playwright>=1.45.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+urllib3>=2.0.0
