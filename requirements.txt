@@ -1,5 +1,7 @@
 streamlit
 openai
+pandas
 requests
 beautifulsoup4
 playwright
+openpyxl
