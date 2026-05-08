@@ -697,6 +697,7 @@ def click_cookie_banners(page) -> int:
         "[aria-label='Close']",
         "[aria-label='Закрыть']",
         "[data-testid='close']",
+        
     ]
 
     for selector in selectors:
@@ -786,6 +787,11 @@ def click_safe_expandable_elements(page, max_clicks: int = 100) -> List[str]:
         "summary",
         "[aria-expanded='false']",
         "[data-testid*='accordion']",
+        "[data-qa-type='uikit/accordion.item']",
+        "[data-qa-type*='accordion']",
+        "[data-qa-type*='Accordion']",
+        "[data-qa-type*='collapse']",
+        "[data-qa-type*='spoiler']",
         "[class*='accordion']",
         "[class*='Accordion']",
         "[class*='faq']",
@@ -797,7 +803,7 @@ def click_safe_expandable_elements(page, max_clicks: int = 100) -> List[str]:
         "[class*='tab']",
         "[class*='Tab']",
     ]
-
+    
     for selector in selectors:
         try:
             elements = page.locator(selector)
