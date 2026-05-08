@@ -1,6 +1,6 @@
 from pathlib import Path
 
-app_code = r'''import json
+import json
 import os
 import re
 import time
