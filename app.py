@@ -1,11 +1,21 @@
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
 from openai import OpenAI
+from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+import hashlib
+import time
+
 
 # =========================
-# DATA
+# CONFIG
 # =========================
+
+client = OpenAI()
+
+MAX_DEPTH = 2
+WAIT_AFTER_CLICK = 0.8
+
 
 PRODUCT_BANK_URLS = {
     "КНЗ: кредит под залог недвижимости": [
@@ -16,285 +26,252 @@ PRODUCT_BANK_URLS = {
         {"name": "Газпромбанк", "url": "https://www.gazprombank.ru/personal/bail/pod-zalog/"},
         {"name": "Альфа-Банк", "url": "https://alfabank.ru/get-money/credit/pod-zalog/"},
     ],
-
     "КНА: кредит под залог автомобиля": [
         {"name": "Т-Банк", "url": "https://www.tbank.ru/loans/cash-loan/auto/"},
         {"name": "Совкомбанк", "url": "https://sovcombank.ru/credits/cash/pod-zalog-avto-"},
         {"name": "ВТБ", "url": "https://www.vtb.ru/personal/kredit/pod-zalog-avto/"},
     ],
-
-    "Автокредит": [
-        {"name": "ПСБ", "url": "https://www.psbank.ru/new-subjects/auto-start"},
-        {"name": "Т-Банк", "url": "https://www.tbank.ru/loans/auto-loan/"},
-        {"name": "Совкомбанк", "url": "https://sovcombank.ru/apply/auto/onlajn-zayavka-na-avtokredit/"},
-        {"name": "Альфа-Банк", "url": "https://alfabank.ru/get-money/autocredit/"},
-        {"name": "Сбер", "url": "https://www.sberbank.ru/ru/person/credits/money/avtokredit_ab"},
-        {"name": "ВТБ", "url": "https://www.vtb.ru/personal/avtokredity/moskva/"},
-    ],
-
-    "Кредит наличными": [
-        {"name": "Уралсиб", "url": "https://uralsib.ru/kredity/kredit-na-lyubye-tseli"},
-        {"name": "ЛокоБанк", "url": "https://www.lockobank.ru/personal/kredit/nalichnymi/"},
-        {"name": "Сбер", "url": "https://www.sberbank.ru/ru/person/credits/money/consumer_unsecured"},
-        {"name": "Т-Банк", "url": "https://www.tbank.ru/loans/cash-loan/"},
-        {"name": "Совкомбанк", "url": "https://sovcombank.ru/apply/credit/city-moskva/"},
-        {"name": "Альфа-Банк", "url": "https://alfabank.ru/get-money/credit/credit-cash/"},
-        {"name": "ОТП Банк", "url": "https://www.otpbank.ru/retail/credits/cash/moscow/"},
-        {"name": "ВТБ", "url": "https://www.vtb.ru/personal/kredit/moskva/"},
-    ],
 }
-
-# =========================
-# UI
-# =========================
-
-st.set_page_config(page_title="Battle Cards")
-
-st.title("Баттл-карты (LLM + парсинг)")
-
-api_key = st.text_input("API Key", type="password")
-folder_id = st.text_input("Folder ID")
-
-battle_card_type = st.selectbox(
-    "Тип баттл-карты",
-    list(PRODUCT_BANK_URLS.keys())
-)
-
-banks = PRODUCT_BANK_URLS[battle_card_type]
-
-selected = st.multiselect(
-    "Банки",
-    [b["name"] for b in banks],
-    default=[b["name"] for b in banks]
-)
-
-model = f"gpt://{folder_id}/gpt-oss-120b/latest" if folder_id else None
-
-
-# =========================
-# CLIENT
-# =========================
-
-def get_client():
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://ai.api.cloud.yandex.net/v1",
-        project=folder_id
-    )
-
-
-# =========================
-# SCRAPER
-# =========================
-
-def scrape(url: str) -> str:
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
-    r.encoding = r.apparent_encoding
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    return soup.get_text(" ", strip=True)[:6000]
-
-
-# =========================
-# SAFE RESPONSE
-# =========================
-
-def extract(resp):
-    try:
-        return resp.output[0].content[0].text
-    except:
-        try:
-            return resp.output_text
-        except:
-            return str(resp.output)
-
-
-# =========================
-# PROMPTS (ТВОИ, БЕЗ УПРОЩЕНИЯ)
-# =========================
-
-def get_structure(battle_card_type: str) -> str:
-
-    if battle_card_type == "КНА: кредит под залог автомобиля":
-        return """
-## Основные параметры кредита
-| Параметр | Содержание |
-|---|---|
-| Название банка | |
-| URL источника | |
-| Название продукта | |
-| Тип кредита | |
-| Процентная ставка | |
-| Полная стоимость кредита / ПСК | |
-| Максимальная сумма кредита | |
-| Минимальная сумма кредита | |
-| Максимальный срок кредитования | |
-| Минимальный срок кредитования | |
-| Валюта кредита | |
-| График платежей | |
-| Целевое / нецелевое использование средств | |
-
-## Залоговое обеспечение
-| Параметр | Содержание |
-|---|---|
-| Требуется ли залог автомобиля | |
-| Какие транспортные средства принимаются в залог | |
-| Легковые автомобили | |
-| Коммерческий транспорт | |
-| Мототехника | |
-| Иностранные / отечественные автомобили | |
-| Максимальный возраст автомобиля | |
-| Требования к техническому состоянию | |
-| Требования к регистрации автомобиля | |
-| Требования к собственнику автомобиля | |
-| Возможность залога автомобиля третьего лица | |
-| Максимальный процент от оценочной стоимости / LTV | |
-| Необходимость оценки автомобиля | |
-| Способ оценки автомобиля | |
-| Ограничения на использование автомобиля во время кредита | |
-
-## ПТС / ЭПТС и обременение
-| Параметр | Содержание |
-|---|---|
-| Требуется ли передача ПТС | |
-| Работа с электронным ПТС / ЭПТС | |
-| Накладывается ли обременение / запрет регистрационных действий | |
-| Возможность пользоваться автомобилем во время кредита | |
-| Возможность продажи автомобиля до погашения кредита | |
-| Условия снятия обременения после погашения | |
-
-## Требования к заемщику
-| Параметр | Содержание |
-|---|---|
-| Возрастные ограничения | |
-| Гражданство / резидентство | |
-| Регистрация | |
-| Требования к доходу | |
-| Условия трудоустройства | |
-| Минимальный стаж работы | |
-| Требования к кредитной истории | |
-| Возможность привлечения созаемщиков | |
-| Требования к собственнику залога, если он не заемщик | |
-
-## Оформление и получение денег
-| Параметр | Содержание |
-|---|---|
-| Способы подачи заявки | |
-| Возможность онлайн-заявки | |
-| Возможность заполнения через Госуслуги | |
-| Срок рассмотрения заявки | |
-| Необходимые документы заемщика | |
-| Документы на автомобиль | |
-| Требуется ли подтверждение дохода | |
-| Требуется ли осмотр автомобиля | |
-| Требуется ли фотографирование автомобиля | |
-| Необходимость визита в офис | |
-| Возможность встречи с представителем | |
-| Способы получения средств | |
-| Скорость получения денег после одобрения | |
-
-## Страхование и дополнительные услуги
-| Параметр | Содержание |
-|---|---|
-| Требуется ли каско | |
-| Влияние каско на ставку | |
-| ОСАГО | |
-| Страхование жизни и здоровья | |
-| Финансовая защита | |
-| Дополнительные услуги и пакеты | |
-| Возможность отказаться от дополнительных услуг | |
-
-## Комиссии, расходы и санкции
-| Параметр | Содержание |
-|---|---|
-| Комиссия за выдачу кредита | |
-| Комиссия за оценку автомобиля | |
-| Комиссия за перевод / снятие денег | |
-| Обслуживание счета | |
-| Досрочное погашение | |
-| Частичное досрочное погашение | |
-| Штрафы / пени за просрочку | |
-| Иные комиссии и расходы | |
-
-## Гибкость и специальные условия
-| Параметр | Содержание |
-|---|---|
-| Условия для зарплатных клиентов | |
-| Условия для действующих клиентов | |
-| Программы лояльности | |
-| Персональные предложения | |
-| Возможность рефинансирования | |
-| Акции и временные предложения | |
-"""
-    return "### структура не задана"
 
 
 # =========================
 # LLM
 # =========================
 
-def analyze(text, bank_name, url):
-
-    structure = get_structure(battle_card_type)
-
-    prompt = f"""
-Тип баттл-карты: {battle_card_type}
-Цель: составить максимально полную таблицу условий продукта для банка {bank_name}.
-
-Источник: {url}
-
-Работай только на основании предоставленного текста.
-Не делай предположений.
-Если информации нет — пиши: Не указано.
-Если есть противоречие — укажи оба значения.
-
-Верни строго Markdown.
-
-СТРУКТУРА:
-{structure}
-
-ТЕКСТ:
-{text}
-"""
-
-    client = get_client()
-
-    resp = client.responses.create(
-        model=model,
-        input=prompt,
-        temperature=0.2,
-        max_output_tokens=1200
+def call_llm(prompt: str):
+    response = client.responses.create(
+        model="gpt-5.3-mini",
+        input=prompt
     )
 
-    return extract(resp)
+    try:
+        return response.output[0].content[0].text
+    except Exception:
+        return None
 
 
 # =========================
-# RUN
+# HTML PROCESSING
 # =========================
 
-if st.button("Запуск"):
+def hash_text(text):
+    return hashlib.md5(text.encode()).hexdigest()
 
-    results = []
 
-    for bank in banks:
-        if bank["name"] not in selected:
+def clean_html(html):
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    return soup.get_text("\n")
+
+
+# =========================
+# BROWSER LOGIC
+# =========================
+
+def expand_accordions(page):
+    selectors = [
+        "[data-testid*='accordion']",
+        ".accordion",
+        "button[aria-expanded]",
+        "details summary"
+    ]
+
+    for sel in selectors:
+        items = page.locator(sel).all()
+        for item in items:
+            try:
+                item.click()
+            except:
+                pass
+
+
+def extract_all_tabs(page):
+    pages = []
+
+    tab_selectors = [
+        "[role='tab']",
+        ".tabs__item",
+        "button[aria-controls]",
+        ".tab"
+    ]
+
+    tabs = []
+    for sel in tab_selectors:
+        tabs.extend(page.locator(sel).all())
+
+    if not tabs:
+        return [page.content()]
+
+    for i in range(len(tabs)):
+        try:
+            tabs[i].click()
+            page.wait_for_timeout(int(WAIT_AFTER_CLICK * 1000))
+            pages.append(page.content())
+        except:
             continue
 
-        st.write(f"Парсинг: {bank['name']}")
+    return pages
 
-        text = scrape(bank["url"])
 
-        st.write(text[:200])
+def extract_internal_links(page, base_url):
+    try:
+        links = page.locator("a").evaluate_all("els => els.map(e => e.href)")
+    except:
+        return []
 
-        st.write("LLM...")
+    return list(set([l for l in links if l and base_url in l]))
 
-        table = analyze(text, bank["name"], bank["url"])
 
-        results.append((bank["name"], table))
+# =========================
+# CRAWLER
+# =========================
 
-    st.subheader("Результаты")
+def crawl(url):
+    visited = set()
+    queue = [(url, 0)]
+    pages = []
 
-    for name, table in results:
-        st.markdown(f"## {name}")
-        st.markdown(table)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+
+        while queue:
+            current_url, depth = queue.pop(0)
+
+            if current_url in visited or depth > MAX_DEPTH:
+                continue
+
+            visited.add(current_url)
+
+            page = browser.new_page()
+
+            try:
+                page.goto(current_url, wait_until="networkidle", timeout=60000)
+
+                expand_accordions(page)
+
+                tab_pages = extract_all_tabs(page)
+                pages.extend(tab_pages)
+
+                links = extract_internal_links(page, url)
+                for l in links:
+                    queue.append((l, depth + 1))
+
+            except:
+                pass
+            finally:
+                page.close()
+
+        browser.close()
+
+    return pages
+
+
+# =========================
+# NORMALIZATION
+# =========================
+
+def normalize(html_pages):
+    seen = set()
+    texts = []
+
+    for html in html_pages:
+        h = hash_text(html)
+        if h in seen:
+            continue
+
+        seen.add(h)
+        texts.append(clean_html(html))
+
+    return "\n\n".join(texts)
+
+
+# =========================
+# PROMPTS
+# =========================
+
+def build_prompt(battle_card_type, bank_name, url, text, structure):
+    return (
+        f"Тип баттл-карты: {battle_card_type}\n"
+        f"Банк: {bank_name}\n"
+        f"Источник: {url}\n\n"
+        "Работай строго по тексту.\n"
+        "Не используй внешние знания.\n"
+        "Если нет данных — пиши: Не указано.\n"
+        "Если есть расхождения — фиксируй оба значения.\n\n"
+        f"{structure}\n\n"
+        f"ТЕКСТ:\n\n{text}"
+    )
+
+
+# =========================
+# PIPELINE
+# =========================
+
+def run_pipeline(battle_card_type):
+    results = []
+
+    for bank in PRODUCT_BANK_URLS[battle_card_type]:
+        name = bank["name"]
+        url = bank["url"]
+
+        html_pages = crawl(url)
+        text = normalize(html_pages)
+
+        prompt = build_prompt(
+            battle_card_type,
+            name,
+            url,
+            text,
+            structure="""
+## Основные параметры кредита
+| Параметр | Содержание |
+|---|---|
+| Название банка | |
+| Процентная ставка | |
+| ПСК | |
+| Сумма | |
+| Срок | |
+"""
+        )
+
+        llm_result = call_llm(prompt)
+
+        results.append({
+            "bank": name,
+            "url": url,
+            "result": llm_result
+        })
+
+    return results
+
+
+# =========================
+# STREAMLIT UI
+# =========================
+
+st.set_page_config(page_title="Bank Battle Cards", layout="wide")
+
+st.title("Bank Battle Card Extractor")
+
+battle_card_type = st.selectbox(
+    "Тип продукта",
+    list(PRODUCT_BANK_URLS.keys())
+)
+
+if st.button("Запустить парсинг"):
+    with st.spinner("Собираю данные..."):
+        data = run_pipeline(battle_card_type)
+
+    st.success("Готово")
+
+    for item in data:
+        st.subheader(item["bank"])
+        st.write(item["url"])
+
+        if item["result"]:
+            st.markdown(item["result"])
+        else:
+            st.error("LLM вернул пустой ответ")
