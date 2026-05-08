@@ -1,9 +1,8 @@
 import streamlit as st
-from openai import OpenAI
-import json
+import openai
 
 # =========================
-# CONFIG: LINKS
+# CONFIG: BANK LINKS
 # =========================
 
 PRODUCT_BANK_URLS = {
@@ -41,11 +40,12 @@ PRODUCT_BANK_URLS = {
 }
 
 # =========================
-# STREAMLIT SETUP
+# STREAMLIT UI
 # =========================
 
 st.set_page_config(page_title="Battle Cards", layout="wide")
-st.title("Баттл-карты (YandexGPT + парсинг)")
+
+st.title("Баттл-карты (Yandex LLM + парсинг ссылок)")
 
 api_key = st.text_input("Yandex API Key", type="password")
 folder_id = st.text_input("Folder ID")
@@ -63,37 +63,28 @@ selected = st.multiselect(
     default=[b["name"] for b in banks]
 )
 
-model = f"gpt://{folder_id}/yandexgpt/latest" if folder_id else None
+# =========================
+# YANDEX CLIENT
+# =========================
 
-# =========================
-# CLIENT (YANDEX)
-# =========================
+YANDEX_CLOUD_MODEL = "gpt-oss-120b/latest"
 
 def get_client():
-    return OpenAI(
+    return openai.OpenAI(
         api_key=api_key,
-        base_url="https://llm.api.cloud.yandex.net/v1",
+        base_url="https://ai.api.cloud.yandex.net/v1",
         project=folder_id
     )
 
-# =========================
-# PROMPTS (НЕ УПРОЩАТЬ)
-# =========================
+client = None
+if api_key and folder_id:
+    client = get_client()
 
-def get_structure(battle_card_type: str) -> str:
-    if battle_card_type == "КНА: кредит под залог автомобиля":
-        return """(структура КНА ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ — ВСТАВЬ СЮДА ПОЛНЫЙ ОРИГИНАЛ)"""
-    if battle_card_type == "КНЗ: кредит под залог недвижимости":
-        return """(структура КНЗ ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ — ВСТАВЬ СЮДА ПОЛНЫЙ ОРИГИНАЛ)"""
-    if battle_card_type == "Автокредит":
-        return """(структура Автокредит ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ — ВСТАВЬ СЮДА ПОЛНЫЙ ОРИГИНАЛ)"""
-    if battle_card_type == "Кредит наличными":
-        return """(структура наличные ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ — ВСТАВЬ СЮДА ПОЛНЫЙ ОРИГИНАЛ)"""
-    return "NO STRUCTURE"
+# =========================
+# PROMPT BUILDER (СТРОГИЙ)
+# =========================
 
 def build_prompt(battle_card_type, bank_name, url, text):
-    structure = get_structure(battle_card_type)
-
     return (
         f"Тип баттл-карты: {battle_card_type}\n"
         f"Цель: составить максимально полную таблицу условий продукта для банка {bank_name}.\n\n"
@@ -104,67 +95,63 @@ def build_prompt(battle_card_type, bank_name, url, text):
         "Если информации нет — пиши: Не указано.\n"
         "Если данные косвенные — помечай: упоминается косвенно.\n"
         "Если есть противоречие — укажи оба значения.\n"
-        "НЕ удаляй числовые параметры.\n"
+        "Не удаляй числовые параметры (ставки, сроки, суммы, LTV, ПСК).\n"
         "Верни результат строго в Markdown.\n\n"
-        f"{structure}\n\n"
         f"Текст:\n{text}"
     )
 
 # =========================
-# PARSE LINKS
+# LLM CALL (YANDEX RESPONSES API)
 # =========================
 
-def build_sources():
-    sources = []
-    for b in banks:
-        if b["name"] in selected:
-            sources.append(b)
-    return sources
-
-# =========================
-# SAFE LLM CALL
-# =========================
-
-def call_llm(prompt):
-    client = get_client()
-
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "Ты строгий аналитик банковских продуктов."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
-    )
-
+def call_llm(prompt: str) -> str:
     try:
-        return resp.choices[0].message.content
-    except Exception:
-        return "Ошибка: пустой или некорректный ответ модели"
+        response = client.responses.create(
+            model=f"gpt://{folder_id}/{YANDEX_CLOUD_MODEL}",
+            temperature=0.3,
+            instructions="Ты строгий аналитик банковских продуктов. Не выдумывай данные.",
+            input=prompt,
+            max_output_tokens=2000
+        )
+
+        return response.output_text or "Пустой ответ модели"
+
+    except Exception as e:
+        return f"Ошибка LLM: {str(e)}"
 
 # =========================
-# MAIN LOGIC
+# BANK FILTER
+# =========================
+
+def get_selected_sources():
+    return [
+        b for b in banks
+        if b["name"] in selected
+    ]
+
+# =========================
+# MAIN ACTION
 # =========================
 
 if st.button("Сформировать общую таблицу"):
 
-    if not api_key or not folder_id:
-        st.error("Нужны API Key и Folder ID")
+    if not client:
+        st.error("Введите API Key и Folder ID")
         st.stop()
 
-    sources = build_sources()
+    sources = get_selected_sources()
 
     if not sources:
         st.error("Не выбраны банки")
         st.stop()
 
-    all_results = []
+    results = []
 
     for bank in sources:
         url = bank["url"]
 
-        # здесь можно позже подключить реальный парсинг HTML
-        fake_text = f"Содержимое страницы банка: {bank['name']} ({url})"
+        # TODO: сюда позже вставим реальный HTML-парсинг
+        fake_text = f"Содержимое страницы: {bank['name']} ({url})"
 
         prompt = build_prompt(
             battle_card_type,
@@ -175,23 +162,23 @@ if st.button("Сформировать общую таблицу"):
 
         result = call_llm(prompt)
 
-        all_results.append({
+        results.append({
             "bank": bank["name"],
             "url": url,
             "result": result
         })
 
     # =========================
-    # FINAL OUTPUT (ОБЩАЯ ТАБЛИЦА)
+    # GLOBAL TABLE (ОДНА)
     # =========================
 
     st.subheader("Общая баттл-таблица")
 
-    combined = ""
+    output = ""
 
-    for r in all_results:
-        combined += f"\n\n# {r['bank']}\n\n"
-        combined += f"Источник: {r['url']}\n\n"
-        combined += r["result"]
+    for r in results:
+        output += f"\n\n---\n\n## {r['bank']}\n"
+        output += f"Источник: {r['url']}\n\n"
+        output += r["result"]
 
-    st.markdown(combined)
+    st.markdown(output)
