@@ -6,7 +6,8 @@ import os
 import re
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin, urlparse
 
 import openai
 import pandas as pd
@@ -14,6 +15,11 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
 
 
 # =========================
@@ -126,9 +132,14 @@ YANDEX_MODEL = os.getenv("YANDEX_MODEL", "gpt-oss-120b/latest")
 
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 
-MAX_SOURCE_CHARS = 25000
+MAX_SOURCE_CHARS = 35000
 REQUESTS_TIMEOUT = 8
-PLAYWRIGHT_TIMEOUT = 20000
+PLAYWRIGHT_TIMEOUT = 25000
+
+MAX_CLICK_ELEMENTS = 45
+MAX_PDF_FILES = 8
+MAX_PDF_PAGES = 20
+MAX_TEXT_BLOCKS = 90
 
 
 # =========================
@@ -252,7 +263,7 @@ def render_runtime_panel() -> None:
 
     with st.expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-200:]:
+            for item in st.session_state.logs[-300:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -277,6 +288,39 @@ def clean_text(text: str) -> str:
             lines.append(line)
 
     return "\n".join(lines)
+
+
+def normalize_space(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def text_fingerprint(text: str, limit: int = 500) -> str:
+    return normalize_space(text.lower())[:limit]
+
+
+def add_text_block(
+    blocks: List[str],
+    title: str,
+    content: str,
+    seen: set,
+    min_len: int = 40,
+) -> bool:
+    content = clean_text(content)
+
+    if len(content) < min_len:
+        return False
+
+    fp = text_fingerprint(content)
+
+    if not fp or fp in seen:
+        return False
+
+    seen.add(fp)
+    blocks.append(f"\n\n--- {title} ---\n{content}")
+
+    return True
 
 
 def parse_params_from_text(text: str) -> List[str]:
@@ -445,7 +489,6 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Battle Card")
 
-        workbook = writer.book
         worksheet = writer.sheets["Battle Card"]
 
         for column_cells in worksheet.columns:
@@ -485,7 +528,107 @@ def build_dataframe_from_records(
 
 
 # =========================
-# PARSERS
+# PDF HELPERS
+# =========================
+
+def is_pdf_url(url: str) -> bool:
+    if not url:
+        return False
+
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+
+    if path.endswith(".pdf"):
+        return True
+
+    if ".pdf" in path:
+        return True
+
+    return False
+
+
+def safe_filename_from_url(url: str, fallback: str = "document.pdf") -> str:
+    try:
+        path = urlparse(url).path
+        name = os.path.basename(path)
+        name = name.split("?")[0].strip()
+        if not name:
+            return fallback
+        if not name.lower().endswith(".pdf"):
+            name += ".pdf"
+        return re.sub(r"[^a-zA-Zа-яА-Я0-9_\-.]+", "_", name)
+    except Exception:
+        return fallback
+
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, filename: str) -> str:
+    if PdfReader is None:
+        return f"[PDF] {filename}: библиотека pypdf не установлена, текст PDF не извлечён."
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        parts = []
+
+        total_pages = len(reader.pages)
+        pages_to_read = min(total_pages, MAX_PDF_PAGES)
+
+        for page_index in range(pages_to_read):
+            try:
+                page_text = reader.pages[page_index].extract_text() or ""
+                page_text = clean_text(page_text)
+                if page_text:
+                    parts.append(f"\n[Страница {page_index + 1}]\n{page_text}")
+            except Exception as exc:
+                parts.append(f"\n[Страница {page_index + 1}] Ошибка извлечения текста: {repr(exc)}")
+
+        if not parts:
+            return f"[PDF] {filename}: текст не извлечён."
+
+        suffix = ""
+        if total_pages > pages_to_read:
+            suffix = f"\n\n[PDF] Прочитано {pages_to_read} страниц из {total_pages}."
+
+        return f"[PDF] {filename}\n" + "\n".join(parts) + suffix
+
+    except Exception as exc:
+        return f"[PDF] {filename}: ошибка чтения PDF: {repr(exc)}"
+
+
+def download_and_extract_pdf(pdf_url: str, page_url: str) -> str:
+    absolute_url = urljoin(page_url, pdf_url)
+    filename = safe_filename_from_url(absolute_url)
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Referer": page_url,
+    }
+
+    response = requests.get(
+        absolute_url,
+        headers=headers,
+        timeout=REQUESTS_TIMEOUT,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+    content_type = response.headers.get("Content-Type", "").lower()
+
+    if "pdf" not in content_type and not absolute_url.lower().endswith(".pdf"):
+        return f"[PDF] {filename}: ссылка не похожа на PDF после загрузки. Content-Type: {content_type}"
+
+    log(f"[PDF] Скачан: {filename}")
+
+    return extract_text_from_pdf_bytes(response.content, filename)
+
+
+# =========================
+# PARSERS: REQUESTS
 # =========================
 
 def fetch_text_requests(url: str) -> str:
@@ -538,9 +681,382 @@ def fetch_text_requests(url: str) -> str:
     raise last_error
 
 
+# =========================
+# PARSERS: PLAYWRIGHT DEEP SCRAPE
+# =========================
+
+def safe_locator_count(page, selector: str) -> int:
+    try:
+        return page.locator(selector).count()
+    except Exception:
+        return 0
+
+
+def safe_get_body_text(page) -> str:
+    try:
+        return clean_text(page.locator("body").inner_text(timeout=8000))
+    except Exception as exc:
+        log(f"[BODY] Не удалось получить body text: {repr(exc)}")
+        return ""
+
+
+def safe_click_locator(locator, label: str) -> bool:
+    try:
+        locator.scroll_into_view_if_needed(timeout=5000)
+        time.sleep(0.25)
+
+        try:
+            locator.click(timeout=5000)
+        except Exception:
+            locator.evaluate("(el) => el.click()")
+
+        time.sleep(0.9)
+        log(f"[CLICK] {label}: клик выполнен")
+        return True
+
+    except Exception as exc:
+        log(f"[ОШИБКА] Не удалось кликнуть по {label}: {repr(exc)}")
+        return False
+
+
+def collect_pdf_links_from_page(page, base_url: str) -> List[str]:
+    urls = []
+
+    selectors = [
+        'a[href$=".pdf"]',
+        'a[href*=".pdf"]',
+        'a[data-test-id*="file"]',
+        'a[data-test-id*="File"]',
+        'a[href*="download"]',
+        'a[href*="documents"]',
+        'a[href*="files"]',
+    ]
+
+    for selector in selectors:
+        count = safe_locator_count(page, selector)
+
+        for i in range(min(count, 50)):
+            try:
+                href = page.locator(selector).nth(i).get_attribute("href")
+                if not href:
+                    continue
+
+                absolute = urljoin(base_url, href)
+
+                if is_pdf_url(absolute) and absolute not in urls:
+                    urls.append(absolute)
+
+            except Exception:
+                continue
+
+    return urls[:MAX_PDF_FILES]
+
+
+def collect_text_from_pdf_links(pdf_links: List[str], page_url: str) -> str:
+    pdf_texts = []
+
+    if not pdf_links:
+        return ""
+
+    log(f"[PDF] Найдено PDF-ссылок: {len(pdf_links)}")
+
+    for index, pdf_url in enumerate(pdf_links, start=1):
+        try:
+            log(f"[PDF #{index}] Пробую скачать: {pdf_url}")
+            pdf_text = download_and_extract_pdf(pdf_url, page_url)
+            pdf_texts.append(f"\n\n--- PDF #{index}: {pdf_url} ---\n{pdf_text}")
+        except Exception as exc:
+            log(f"[PDF #{index}] Ошибка при скачивании {pdf_url}: {repr(exc)}")
+            pdf_texts.append(f"\n\n--- PDF #{index}: {pdf_url} ---\nОшибка скачивания или чтения PDF: {repr(exc)}")
+
+    return "\n".join(pdf_texts)
+
+
+def click_accordions_and_collect(page, blocks: List[str], seen: set) -> None:
+    selectors = [
+        '[data-test-id^="accordion-header-"]',
+        '[data-testid^="accordion-header-"]',
+        '[role="button"][aria-expanded]',
+        'button[aria-expanded]',
+        'summary',
+        '[class*="accordion" i]',
+        '[class*="spoiler" i]',
+        '[class*="collapse" i]',
+    ]
+
+    clicked = 0
+
+    for selector in selectors:
+        count = safe_locator_count(page, selector)
+
+        if count == 0:
+            continue
+
+        log(f"[Аккордеоны] selector='{selector}', найдено: {count}")
+
+        for i in range(min(count, MAX_CLICK_ELEMENTS)):
+            if clicked >= MAX_CLICK_ELEMENTS:
+                return
+
+            try:
+                locator = page.locator(selector).nth(i)
+
+                try:
+                    if not locator.is_visible(timeout=1000):
+                        continue
+                except Exception:
+                    pass
+
+                label = f"Аккордеон #{clicked + 1}"
+
+                clicked_ok = safe_click_locator(locator, label)
+
+                if not clicked_ok:
+                    continue
+
+                text = safe_get_body_text(page)
+                added = add_text_block(
+                    blocks=blocks,
+                    title=label,
+                    content=text,
+                    seen=seen,
+                    min_len=120,
+                )
+
+                if added:
+                    log(f"[{label}] Текст записан")
+                else:
+                    log(f"[{label}] Текст не добавлен: дубль или мало текста")
+
+                clicked += 1
+
+            except Exception as exc:
+                log(f"[Аккордеон #{clicked + 1}] Ошибка: {repr(exc)}")
+
+
+def click_tabs_and_collect(page, blocks: List[str], seen: set) -> None:
+    selectors = [
+        '[role="tab"]',
+        '[data-test-id*="TabsHeader"]',
+        '[data-testid*="TabsHeader"]',
+        'button[class*="tab" i]',
+        '[class*="tabs"] button',
+        '[class*="tab"]',
+    ]
+
+    clicked = 0
+
+    for selector in selectors:
+        count = safe_locator_count(page, selector)
+
+        if count == 0:
+            continue
+
+        log(f"[Табы] selector='{selector}', найдено: {count}")
+
+        for i in range(min(count, MAX_CLICK_ELEMENTS)):
+            if clicked >= MAX_CLICK_ELEMENTS:
+                return
+
+            try:
+                locator = page.locator(selector).nth(i)
+
+                try:
+                    if not locator.is_visible(timeout=1000):
+                        continue
+                except Exception:
+                    pass
+
+                tab_text = ""
+                try:
+                    tab_text = normalize_space(locator.inner_text(timeout=1500))
+                except Exception:
+                    tab_text = ""
+
+                title = f"Таб #{clicked + 1}"
+                if tab_text:
+                    title = f"Таб #{clicked + 1}: {tab_text[:80]}"
+
+                clicked_ok = safe_click_locator(locator, title)
+
+                if not clicked_ok:
+                    continue
+
+                text = safe_get_body_text(page)
+                added = add_text_block(
+                    blocks=blocks,
+                    title=title,
+                    content=text,
+                    seen=seen,
+                    min_len=120,
+                )
+
+                if added:
+                    log(f"[{title}] Текст записан")
+                else:
+                    log(f"[{title}] Текст не добавлен: дубль или мало текста")
+
+                clicked += 1
+
+            except Exception as exc:
+                log(f"[Таб #{clicked + 1}] Ошибка: {repr(exc)}")
+
+
+def click_more_buttons_and_collect(page, blocks: List[str], seen: set) -> None:
+    labels_regex = re.compile(
+        r"(показать|раскрыть|развернуть|ещ[её]|подробнее|читать|условия|тариф|документ|требован|faq|вопрос)",
+        flags=re.IGNORECASE,
+    )
+
+    selectors = [
+        "button",
+        'a[role="button"]',
+        '[role="button"]',
+        'a[href="#"]',
+    ]
+
+    clicked = 0
+
+    for selector in selectors:
+        count = safe_locator_count(page, selector)
+
+        if count == 0:
+            continue
+
+        log(f"[Кнопки] selector='{selector}', найдено: {count}")
+
+        for i in range(min(count, 80)):
+            if clicked >= MAX_CLICK_ELEMENTS:
+                return
+
+            try:
+                locator = page.locator(selector).nth(i)
+
+                try:
+                    if not locator.is_visible(timeout=1000):
+                        continue
+                except Exception:
+                    pass
+
+                text = ""
+                try:
+                    text = normalize_space(locator.inner_text(timeout=1500))
+                except Exception:
+                    text = ""
+
+                aria = ""
+                try:
+                    aria = locator.get_attribute("aria-label") or ""
+                except Exception:
+                    aria = ""
+
+                test_id = ""
+                try:
+                    test_id = locator.get_attribute("data-test-id") or locator.get_attribute("data-testid") or ""
+                except Exception:
+                    test_id = ""
+
+                joined = " ".join([text, aria, test_id]).strip()
+
+                if not joined:
+                    continue
+
+                if not labels_regex.search(joined):
+                    continue
+
+                label = f"Кнопка #{clicked + 1}: {joined[:100]}"
+
+                clicked_ok = safe_click_locator(locator, label)
+
+                if not clicked_ok:
+                    continue
+
+                body_text = safe_get_body_text(page)
+                added = add_text_block(
+                    blocks=blocks,
+                    title=label,
+                    content=body_text,
+                    seen=seen,
+                    min_len=120,
+                )
+
+                if added:
+                    log(f"[{label}] Текст записан")
+                else:
+                    log(f"[{label}] Текст не добавлен: дубль или мало текста")
+
+                clicked += 1
+
+            except Exception as exc:
+                log(f"[Кнопка #{clicked + 1}] Ошибка: {repr(exc)}")
+
+
+def collect_structured_sections(page, blocks: List[str], seen: set) -> None:
+    selectors = [
+        "main",
+        "section",
+        "article",
+        '[data-widget-name]',
+        '[data-test-id]',
+        '[data-testid]',
+        "h1",
+        "h2",
+        "h3",
+    ]
+
+    added_count = 0
+
+    for selector in selectors:
+        count = safe_locator_count(page, selector)
+
+        if count == 0:
+            continue
+
+        log(f"[Секции] selector='{selector}', найдено: {count}")
+
+        for i in range(min(count, 40)):
+            if added_count >= MAX_TEXT_BLOCKS:
+                return
+
+            try:
+                locator = page.locator(selector).nth(i)
+
+                try:
+                    if not locator.is_visible(timeout=1000):
+                        continue
+                except Exception:
+                    pass
+
+                text = locator.inner_text(timeout=3000)
+                text = clean_text(text)
+
+                if not text:
+                    continue
+
+                title = f"Секция {selector} #{i + 1}"
+
+                added = add_text_block(
+                    blocks=blocks,
+                    title=title,
+                    content=text,
+                    seen=seen,
+                    min_len=80,
+                )
+
+                if added:
+                    added_count += 1
+                    log(f"[{title}] Текст записан")
+
+            except Exception:
+                continue
+
+
 def fetch_text_playwright(url: str) -> str:
     browser = None
     context = None
+
+    blocks = []
+    seen = set()
 
     try:
         log(f"Playwright: запускаю браузер для {url}")
@@ -554,6 +1070,8 @@ def fetch_text_playwright(url: str) -> str:
                     "--disable-gpu",
                     "--disable-setuid-sandbox",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
                 ],
             )
 
@@ -570,6 +1088,7 @@ def fetch_text_playwright(url: str) -> str:
                 extra_http_headers={
                     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
                 },
+                ignore_https_errors=True,
             )
 
             page = context.new_page()
@@ -587,12 +1106,12 @@ def fetch_text_playwright(url: str) -> str:
             log(f"Playwright: DOM загружен для {url}")
 
             try:
-                page.wait_for_load_state("networkidle", timeout=5000)
+                page.wait_for_load_state("networkidle", timeout=7000)
                 log(f"Playwright: networkidle получен для {url}")
             except Exception:
                 log(f"Playwright: networkidle не дождались, продолжаю для {url}")
 
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(2500)
 
             title = ""
             current_url = ""
@@ -609,25 +1128,61 @@ def fetch_text_playwright(url: str) -> str:
 
             log(f"Playwright: title='{title}', current_url='{current_url}'")
 
-            text = page.locator("body").inner_text(timeout=8000)
-            text = clean_text(text)
+            base_text = safe_get_body_text(page)
+            add_text_block(
+                blocks=blocks,
+                title="Базовый текст страницы",
+                content=base_text,
+                seen=seen,
+                min_len=100,
+            )
+            log(f"[Шаг 1] Базовый текст страницы: {len(base_text)} символов")
 
-            log(f"Playwright: получено символов: {len(text)} для {url}")
+            log("[Шаг 2] Сбор структурных секций")
+            collect_structured_sections(page, blocks, seen)
 
-            if not text:
+            log("[Шаг 3] Аккордеоны")
+            click_accordions_and_collect(page, blocks, seen)
+
+            log("[Шаг 4] Табы")
+            click_tabs_and_collect(page, blocks, seen)
+
+            log("[Шаг 5] Кнопки раскрытия / подробнее")
+            click_more_buttons_and_collect(page, blocks, seen)
+
+            log("[Шаг 6] Повторный сбор структурных секций после кликов")
+            collect_structured_sections(page, blocks, seen)
+
+            log("[Шаг 7] Поиск PDF")
+            pdf_links = collect_pdf_links_from_page(page, current_url or url)
+
+            pdf_text = collect_text_from_pdf_links(pdf_links, current_url or url)
+            add_text_block(
+                blocks=blocks,
+                title="PDF-документы",
+                content=pdf_text,
+                seen=seen,
+                min_len=40,
+            )
+
+            final_text = clean_text("\n".join(blocks))
+
+            log(f"Playwright deep scrape: итоговый текст: {len(final_text)} символов")
+
+            if not final_text:
                 raise RuntimeError(
-                    f"Playwright открыл страницу, но body пустой. "
+                    f"Playwright открыл страницу, но итоговый текст пустой. "
                     f"Title: {title}. Current URL: {current_url}"
                 )
 
-            if len(text) < 300:
+            if len(final_text) < 300:
                 raise RuntimeError(
-                    f"Playwright получил слишком мало текста: {len(text)} символов. "
+                    f"Playwright получил слишком мало текста: {len(final_text)} символов. "
                     f"Title: {title}. Current URL: {current_url}. "
-                    f"Текст: {text[:500]}"
+                    f"Текст: {final_text[:500]}"
                 )
 
-            return text
+            return final_text
 
     except Exception as exc:
         error_text = str(exc)
@@ -682,27 +1237,27 @@ def get_page_text(url: str, company_name: str) -> Dict[str, Any]:
         log(f"{company_name}: requests ошибка: {repr(exc)}")
 
     try:
-        log(f"{company_name}: пробую Playwright: {url}")
+        log(f"{company_name}: пробую Playwright deep scrape: {url}")
         text = fetch_text_playwright(url)
 
         if len(text) >= 300:
             result["text"] = text
-            result["method"] = "playwright"
+            result["method"] = "playwright_deep"
             result["status"] = "ОК"
-            log(f"{company_name}: Playwright успешно, символов: {len(text)}")
+            log(f"{company_name}: Playwright deep scrape успешно, символов: {len(text)}")
             return result
 
         result["text"] = text
-        result["method"] = "playwright"
+        result["method"] = "playwright_deep"
         result["status"] = "Мало текста"
         result["error"] = f"Получено мало текста: {len(text)} символов."
-        log(f"{company_name}: Playwright вернул мало текста: {len(text)} символов")
+        log(f"{company_name}: Playwright deep scrape вернул мало текста: {len(text)} символов")
         return result
 
     except Exception as exc:
         previous_error = result.get("error", "")
         result["error"] = f"requests error: {previous_error}; playwright error: {repr(exc)}"
-        log(f"{company_name}: Playwright ошибка: {repr(exc)}")
+        log(f"{company_name}: Playwright deep scrape ошибка: {repr(exc)}")
         return result
 
 
@@ -787,6 +1342,11 @@ def build_extraction_prompt(
             "Текст страницы был вставлен пользователем вручную, потому что сайт "
             "не отдал данные автоматическому парсеру."
         )
+    elif source_mode == "playwright_deep":
+        source_note = (
+            "Текст страницы был получен усиленным Playwright-парсером: "
+            "собран базовый текст, раскрыты аккордеоны, табы, кнопки и PDF-документы."
+        )
     else:
         source_note = "Текст страницы был получен автоматическим парсером."
 
@@ -825,6 +1385,7 @@ URL источника:
 8. Для параметра "Статус парсинга" укажи одну из формулировок:
    - "Данные извлечены"
    - "Данные частично извлечены"
+   - "Данные извлечены усиленным парсером"
    - "Данные извлечены из текста, вставленного вручную"
    - "На странице мало релевантной информации"
 9. Не добавляй ключи, которых нет в списке параметров.
@@ -1162,6 +1723,7 @@ def run_pipeline(
         source_text = page_result.get("text", "")
         parser_status = page_result.get("status", "Ошибка парсинга")
         parser_error = page_result.get("error", "")
+        parser_method = page_result.get("method", "")
 
         if not source_text:
             log(f"{company_name}: текст страницы не получен.")
@@ -1199,7 +1761,10 @@ def run_pipeline(
 
         try:
             parsing_status = "Данные извлечены"
-            if parser_status != "ОК":
+
+            if parser_method == "playwright_deep":
+                parsing_status = "Данные извлечены усиленным парсером"
+            elif parser_status != "ОК":
                 parsing_status = f"Данные частично извлечены; статус парсинга: {parser_status}"
 
             normalized = extract_record_with_llm(
@@ -1209,7 +1774,7 @@ def run_pipeline(
                 url=url,
                 source_text=source_text,
                 params=params,
-                source_mode="parsed",
+                source_mode=parser_method or "parsed",
                 parsing_status=parsing_status,
             )
 
@@ -1785,5 +2350,4 @@ if st.session_state.last_df is not None and not run_button:
             data=excel_bytes,
             file_name="battle_card.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
         )
