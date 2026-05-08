@@ -123,7 +123,28 @@ if "logs" not in st.session_state:
     st.session_state.logs = []
 
 if "status" not in st.session_state:
-    st.session_state.status = "Idle"
+    st.session_state.status = "Ожидание запуска"
+
+if "progress_value" not in st.session_state:
+    st.session_state.progress_value = 0
+
+if "progress_text" not in st.session_state:
+    st.session_state.progress_text = "Выберите продукт и банки, затем запустите анализ."
+
+if "current_bank" not in st.session_state:
+    st.session_state.current_bank = "—"
+
+if "current_step" not in st.session_state:
+    st.session_state.current_step = "—"
+
+if "completed_banks" not in st.session_state:
+    st.session_state.completed_banks = 0
+
+if "total_banks" not in st.session_state:
+    st.session_state.total_banks = 0
+
+if "user_updates" not in st.session_state:
+    st.session_state.user_updates = []
 
 
 # =========================
@@ -135,37 +156,108 @@ def log(message: str) -> None:
     st.session_state.logs.append(f"[{ts}] {message}")
 
 
-def render_logs() -> None:
-    with st.expander("Технические логи"):
-        st.code("\n".join(st.session_state.logs[-900:]))
+def add_user_update(message: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    st.session_state.user_updates.append(f"[{ts}] {message}")
 
 
-status_box = st.empty()
+def update_runtime_ui(
+    *,
+    status: str | None = None,
+    step: str | None = None,
+    bank: str | None = None,
+    progress: int | None = None,
+    user_message: str | None = None,
+) -> None:
+    if status is not None:
+        st.session_state.status = status
+
+    if step is not None:
+        st.session_state.current_step = step
+
+    if bank is not None:
+        st.session_state.current_bank = bank
+
+    if progress is not None:
+        st.session_state.progress_value = max(0, min(100, int(progress)))
+
+    if user_message:
+        add_user_update(user_message)
+
+    log_parts = []
+    if status:
+        log_parts.append(f"status={status}")
+    if bank:
+        log_parts.append(f"bank={bank}")
+    if step:
+        log_parts.append(f"step={step}")
+    if progress is not None:
+        log_parts.append(f"progress={progress}%")
+
+    if log_parts:
+        log("UI UPDATE: " + " | ".join(log_parts))
 
 
-def set_status(message: str) -> None:
-    st.session_state.status = message
-    status_box.info(f"Статус: {message}")
+def render_runtime_panel() -> None:
+    st.info(st.session_state.status)
+
+    st.progress(
+        st.session_state.progress_value,
+        text=f"{st.session_state.progress_value}% — {st.session_state.progress_text}",
+    )
+
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        st.metric("Текущий банк", st.session_state.current_bank)
+
+    with col_b:
+        st.metric("Этап", st.session_state.current_step)
+
+    with col_c:
+        total = st.session_state.total_banks
+        done = st.session_state.completed_banks
+        st.metric("Готово банков", f"{done} из {total}")
+
+    with st.expander("Что сейчас происходит", expanded=True):
+        if st.session_state.user_updates:
+            for item in st.session_state.user_updates[-12:]:
+                st.write(item)
+        else:
+            st.write("После запуска здесь появятся сообщения о ходе обработки.")
+
+
+@st.dialog("Технические логи", width="large")
+def show_logs_dialog() -> None:
+    st.caption("Эти логи нужны для диагностики парсинга, LLM-ответов и ошибок деплоя.")
+    st.code("\n".join(st.session_state.logs[-1200:]) or "Логов пока нет.")
+
+    if st.button("Закрыть"):
+        st.rerun()
+
+
+def render_logs_button() -> None:
+    if st.button("Технические логи", use_container_width=True):
+        show_logs_dialog()
 
 
 # =========================
 # ENV CHECK / LLM CLIENT
 # =========================
 
+client = None
+
 if not YANDEX_FOLDER or not YANDEX_API_KEY:
     st.error(
         "Не заданы переменные окружения YANDEX_FOLDER и/или YANDEX_API_KEY. "
         "На Render добавь их в Environment Variables."
     )
-    render_logs()
-    st.stop()
-
-
-client = openai.OpenAI(
-    api_key=YANDEX_API_KEY,
-    base_url="https://ai.api.cloud.yandex.net/v1",
-    project=YANDEX_FOLDER,
-)
+else:
+    client = openai.OpenAI(
+        api_key=YANDEX_API_KEY,
+        base_url="https://ai.api.cloud.yandex.net/v1",
+        project=YANDEX_FOLDER,
+    )
 
 
 # =========================
@@ -516,11 +608,17 @@ def fetch_text_playwright(url: str) -> str:
         return normalize_text(text)
 
 
-def get_page_text(url: str) -> str:
+def get_page_text(url: str, bank_name: str) -> str:
     text = ""
 
     try:
-        log("Trying requests parser")
+        update_runtime_ui(
+            bank=bank_name,
+            step="Быстрый парсинг",
+            status=f"Пробую быстро получить текст страницы: {bank_name}",
+            user_message=f"{bank_name}: пробую быстрый парсинг страницы.",
+        )
+
         text = get_text_with_requests(url)
         text = normalize_text(text)
 
@@ -532,6 +630,13 @@ def get_page_text(url: str) -> str:
         log("Requests text is weak. Trying Playwright browser parser.")
 
         try:
+            update_runtime_ui(
+                bank=bank_name,
+                step="Браузерный парсинг",
+                status=f"Быстрого парсинга недостаточно. Открываю страницу в браузере: {bank_name}",
+                user_message=f"{bank_name}: быстрый парсинг дал мало текста, запускаю браузерный режим с прокруткой и кликами.",
+            )
+
             text = fetch_text_playwright(url)
             log(f"Playwright extracted text size: {len(text)}")
             log(f"Playwright preview:\n{text[:1800] if text else 'EMPTY'}")
@@ -542,6 +647,7 @@ def get_page_text(url: str) -> str:
 
     else:
         log("Requests parser result accepted")
+        add_user_update(f"{bank_name}: текст страницы получен быстрым способом.")
 
     return text
 
@@ -625,6 +731,9 @@ def extract_llm_text(response) -> str | None:
 
 
 def call_llm(prompt: str):
+    if client is None:
+        raise RuntimeError("LLM client is not initialized. Check YANDEX_FOLDER and YANDEX_API_KEY.")
+
     return client.responses.create(
         model=f"gpt://{YANDEX_FOLDER}/{YANDEX_MODEL}",
         temperature=0.1,
@@ -715,18 +824,50 @@ def make_error_record(
 
 
 def build_comparison_table(records: list[dict[str, str]], battle_card_type: str) -> pd.DataFrame:
+    """
+    Возвращает таблицу в формате:
+    строки = параметры,
+    столбцы = банки.
+    """
     parameters = get_parameters(battle_card_type)
-    columns = ["Банк"] + parameters
 
-    df = pd.DataFrame(records)
+    source_df = pd.DataFrame(records)
+
+    if "Банк" not in source_df.columns:
+        source_df["Банк"] = "Не указано"
+
+    for parameter in parameters:
+        if parameter not in source_df.columns:
+            source_df[parameter] = "Не указано"
+
+    rows = []
+
+    for parameter in parameters:
+        row = {"Параметр": parameter}
+
+        for _, record in source_df.iterrows():
+            bank_name = str(record.get("Банк", "Не указано"))
+            value = record.get(parameter, "Не указано")
+
+            if pd.isna(value) or value == "":
+                value = "Не указано"
+
+            row[bank_name] = str(value)
+
+        rows.append(row)
+
+    comparison_df = pd.DataFrame(rows)
+
+    bank_columns = [str(record.get("Банк", "Не указано")) for record in records]
+    columns = ["Параметр"] + bank_columns
 
     for column in columns:
-        if column not in df.columns:
-            df[column] = "Не указано"
+        if column not in comparison_df.columns:
+            comparison_df[column] = "Не указано"
 
-    df = df[columns]
+    comparison_df = comparison_df[columns]
 
-    return df
+    return comparison_df
 
 
 # =========================
@@ -736,26 +877,61 @@ def build_comparison_table(records: list[dict[str, str]], battle_card_type: str)
 def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFrame | None:
     try:
         st.session_state.logs = []
-        set_status("Запуск")
+        st.session_state.user_updates = []
+        st.session_state.completed_banks = 0
+        st.session_state.total_banks = len(selected_banks)
+        st.session_state.progress_value = 0
+        st.session_state.progress_text = "Запускаю обработку."
+
+        update_runtime_ui(
+            status="Запуск анализа. Сначала соберу тексты страниц, затем извлеку параметры и соберу таблицу.",
+            step="Запуск",
+            bank="—",
+            progress=0,
+            user_message="Анализ запущен. Итогом будет одна сравнительная таблица по выбранным банкам.",
+        )
 
         records = []
 
-        for bank in selected_banks:
+        total_banks = len(selected_banks)
+
+        for index, bank in enumerate(selected_banks, start=1):
             bank_name = bank["name"]
             bank_url = bank["url"]
 
+            base_progress = int(((index - 1) / max(total_banks, 1)) * 100)
+            parse_progress = min(base_progress + int(35 / max(total_banks, 1)), 95)
+            llm_progress = min(base_progress + int(70 / max(total_banks, 1)), 98)
+
             try:
-                set_status(f"Парсинг: {bank_name}")
+                st.session_state.progress_text = f"{bank_name}: сбор текста страницы."
+
+                update_runtime_ui(
+                    status=f"Обрабатываю {bank_name}: собираю текст страницы.",
+                    step="Сбор текста",
+                    bank=bank_name,
+                    progress=base_progress,
+                    user_message=f"{bank_name}: начал обработку страницы.",
+                )
 
                 log("=" * 80)
                 log(f"START: {bank_name}")
                 log(f"URL: {bank_url}")
 
-                page_text = get_page_text(bank_url)
+                page_text = get_page_text(bank_url, bank_name)
                 page_text = normalize_text(page_text)
 
                 text_size = len(page_text) if page_text else 0
                 log(f"Final extracted text size: {text_size}")
+
+                st.session_state.progress_text = f"{bank_name}: текст собран, проверяю объём."
+                update_runtime_ui(
+                    status=f"{bank_name}: текст страницы собран, проверяю пригодность для анализа.",
+                    step="Проверка текста",
+                    bank=bank_name,
+                    progress=parse_progress,
+                    user_message=f"{bank_name}: извлечено {text_size} символов текста.",
+                )
 
                 if not page_text or len(page_text.strip()) < 1000:
                     log(f"TEXT TOO SMALL AFTER ALL PARSERS: {bank_name} ({text_size})")
@@ -768,12 +944,24 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                             status=f"Недостаточно текста: {text_size} символов",
                         )
                     )
+
+                    st.session_state.completed_banks += 1
+                    add_user_update(f"{bank_name}: данных недостаточно, банк добавлен в таблицу со статусом ошибки.")
                     continue
 
                 limited_text = page_text[:70000]
 
                 if len(page_text) > len(limited_text):
                     log(f"Text truncated for prompt: {len(page_text)} -> {len(limited_text)}")
+
+                st.session_state.progress_text = f"{bank_name}: извлекаю параметры через LLM."
+                update_runtime_ui(
+                    status=f"{bank_name}: отправляю текст в LLM для извлечения параметров.",
+                    step="LLM-анализ",
+                    bank=bank_name,
+                    progress=llm_progress,
+                    user_message=f"{bank_name}: текст передан в LLM, извлекаются параметры продукта.",
+                )
 
                 prompt = build_prompt(
                     battle_card_type=battle_card_type,
@@ -783,7 +971,6 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                 )
 
                 log(f"Prompt size: {len(prompt)}")
-                set_status(f"LLM-анализ: {bank_name}")
 
                 response = call_llm(prompt)
                 log("LLM response received")
@@ -802,9 +989,21 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                             status="LLM вернула пустой ответ",
                         )
                     )
+
+                    st.session_state.completed_banks += 1
+                    add_user_update(f"{bank_name}: LLM вернула пустой ответ, банк добавлен в таблицу со статусом ошибки.")
                     continue
 
                 log(f"LLM raw preview:\n{raw_text[:1000]}")
+
+                st.session_state.progress_text = f"{bank_name}: нормализую ответ и добавляю строку в таблицу."
+                update_runtime_ui(
+                    status=f"{bank_name}: ответ LLM получен, собираю строку сравнительной таблицы.",
+                    step="Сбор таблицы",
+                    bank=bank_name,
+                    progress=min(llm_progress + 5, 99),
+                    user_message=f"{bank_name}: параметры получены, добавляю банк в итоговую таблицу.",
+                )
 
                 parsed = parse_json_from_llm(raw_text)
 
@@ -817,6 +1016,7 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                 )
 
                 records.append(record)
+                st.session_state.completed_banks += 1
 
             except Exception:
                 err = traceback.format_exc()
@@ -833,13 +1033,41 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                     )
                 )
 
+                st.session_state.completed_banks += 1
+                add_user_update(f"{bank_name}: возникла ошибка, банк добавлен в таблицу со статусом ошибки.")
+
+            finally:
+                bank_done_progress = int((index / max(total_banks, 1)) * 100)
+                st.session_state.progress_text = f"Обработано банков: {index} из {total_banks}."
+                update_runtime_ui(
+                    status=f"Завершил обработку банка: {bank_name}.",
+                    step="Банк завершён",
+                    bank=bank_name,
+                    progress=bank_done_progress,
+                )
+
         if not records:
             log("NO RECORDS")
             return None
 
+        update_runtime_ui(
+            status="Формирую итоговую сравнительную таблицу.",
+            step="Формирование таблицы",
+            bank="—",
+            progress=99,
+            user_message="Все выбранные банки обработаны. Формирую единую сравнительную таблицу.",
+        )
+
         comparison_df = build_comparison_table(records, battle_card_type)
 
-        set_status("Готово")
+        st.session_state.progress_text = "Готово."
+        update_runtime_ui(
+            status="Готово. Сравнительная таблица сформирована.",
+            step="Готово",
+            bank="—",
+            progress=100,
+            user_message="Готово: сравнительная таблица сформирована.",
+        )
 
         return comparison_df
 
@@ -853,12 +1081,21 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
 # UI
 # =========================
 
-st.title("Battle Cards Generator")
+top_left, top_right = st.columns([0.82, 0.18])
+
+with top_left:
+    st.title("Battle Cards Generator")
+
+with top_right:
+    render_logs_button()
 
 st.caption(
     "На выходе формируется одна общая сравнительная таблица по выбранным банкам. "
-    "Отдельные карточки банков пользователю не выводятся."
+    "Во время ожидания приложение показывает текущий этап, банк, прогресс и краткие сообщения."
 )
+
+if client is None:
+    st.stop()
 
 battle_card_type = st.selectbox(
     "Тип баттл-карты",
@@ -883,23 +1120,27 @@ with st.expander("Текущие URL"):
     for bank in selected_banks:
         st.write(f"**{bank['name']}** — {bank['url']}")
 
-if st.button("Запустить анализ"):
-    result_df = run_pipeline(battle_card_type, selected_banks)
+render_runtime_panel()
 
-    if result_df is not None and not result_df.empty:
-        st.success("Готово")
-        st.subheader("Сравнительная таблица банков")
-        st.dataframe(result_df, use_container_width=True, hide_index=True)
-
-        csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
-
-        st.download_button(
-            label="Скачать CSV",
-            data=csv_bytes,
-            file_name="bank_comparison.csv",
-            mime="text/csv",
-        )
+if st.button("Запустить анализ", type="primary"):
+    if not selected_banks:
+        st.error("Выбери хотя бы один банк.")
     else:
-        st.error("Получен пустой результат. Смотри технические логи.")
+        result_df = run_pipeline(battle_card_type, selected_banks)
 
-render_logs()
+        if result_df is not None and not result_df.empty:
+            st.success("Готово")
+            st.subheader("Сравнительная таблица: параметры × банки")
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+            csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+
+            st.download_button(
+                label="Скачать CSV",
+                data=csv_bytes,
+                file_name="bank_comparison_parameters_by_banks.csv",
+                mime="text/csv",
+            )
+        else:
+            st.error("Получен пустой результат. Открой технические логи справа вверху.")
+
