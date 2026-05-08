@@ -1,4 +1,6 @@
-import json
+from pathlib import Path
+
+app_code = r'''import json
 import os
 import re
 import time
@@ -185,12 +187,16 @@ def update_runtime_ui(
         add_user_update(user_message)
 
     log_parts = []
+
     if status:
         log_parts.append(f"status={status}")
+
     if bank:
         log_parts.append(f"bank={bank}")
+
     if step:
         log_parts.append(f"step={step}")
+
     if progress is not None:
         log_parts.append(f"progress={progress}%")
 
@@ -221,7 +227,7 @@ def render_runtime_panel() -> None:
 
     with st.expander("Что сейчас происходит", expanded=True):
         if st.session_state.user_updates:
-            for item in st.session_state.user_updates[-12:]:
+            for item in st.session_state.user_updates[-14:]:
                 st.write(item)
         else:
             st.write("После запуска здесь появятся сообщения о ходе обработки.")
@@ -229,8 +235,8 @@ def render_runtime_panel() -> None:
 
 @st.dialog("Технические логи", width="large")
 def show_logs_dialog() -> None:
-    st.caption("Эти логи нужны для диагностики парсинга, LLM-ответов и ошибок деплоя.")
-    st.code("\n".join(st.session_state.logs[-1200:]) or "Логов пока нет.")
+    st.caption("Логи нужны для диагностики парсинга, LLM-ответов, ошибок JSON и деплоя.")
+    st.code("\n".join(st.session_state.logs[-1400:]) or "Логов пока нет.")
 
     if st.button("Закрыть"):
         st.rerun()
@@ -653,14 +659,14 @@ def get_page_text(url: str, bank_name: str) -> str:
 
 
 # =========================
-# PROMPT / JSON EXTRACTION
+# FIRST LAYER: EXTRACTION PROMPT
 # =========================
 
 def get_parameters(battle_card_type: str) -> list[str]:
     return PARAMETER_SETS[battle_card_type]
 
 
-def build_prompt(
+def build_extraction_prompt(
     battle_card_type: str,
     bank_name: str,
     url: str,
@@ -712,6 +718,123 @@ URL:
 """
 
 
+# =========================
+# SECOND LAYER: UNIFICATION PROMPT
+# =========================
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    """
+    Не используем df.to_markdown(), чтобы не требовать отдельный пакет tabulate.
+    """
+    safe_df = df.fillna("Не указано").astype(str)
+
+    columns = list(safe_df.columns)
+
+    def clean_cell(value: str) -> str:
+        value = str(value)
+        value = value.replace("\n", "<br>")
+        value = value.replace("|", "\\|")
+        return value
+
+    header = "| " + " | ".join(clean_cell(col) for col in columns) + " |"
+    separator = "| " + " | ".join("---" for _ in columns) + " |"
+
+    rows = []
+
+    for _, row in safe_df.iterrows():
+        rows.append(
+            "| " + " | ".join(clean_cell(row[col]) for col in columns) + " |"
+        )
+
+    return "\n".join([header, separator] + rows)
+
+
+def build_unification_prompt(markdown_table: str) -> str:
+    return f"""
+### 🎯 Цель:
+
+Унифицировать формулировки условий кредита в таблице, где:
+
+* строки — параметры кредита, например ставка, сумма, срок;
+* столбцы — названия банков;
+* ячейки — текстовые описания условий.
+
+---
+
+### ✅ Что нужно сделать:
+
+Для каждой ячейки:
+
+1. Сохрани только главное:
+   * числа;
+   * диапазоны;
+   * формулировки условий;
+   * критически важные уточнения.
+
+2. Удаляй лишние слова:
+   * "годовых";
+   * "рублей";
+   * "в расчет включены";
+   * "уточнение по материалам";
+   * "на странице продукта";
+   * "источник данных";
+   * "по данным банка";
+   * и другие шумовые формулировки.
+
+3. Соблюдай лаконичность.
+   Преобразуй всё к единому, предельно краткому стилю без потери ключевой информации.
+
+---
+
+### 🧾 Примеры преобразований:
+
+| Было | Стало |
+|---|---|
+| От 21,9% до 33,9% годовых | 21,9%-33,9% |
+| До 180 месяцев (15 лет) | до 15 лет |
+| «От 21 года» | от 21 года |
+| 30 000 000 ₽, но не более 70% от оценки | до 30 млн; ≤70% |
+| Нецелевой кредит «на любые цели» | Нецелевой |
+| Уточнение по материалам банка: при оформлении «услуги по снижению ставки» 12,3%–22,9% | 12,3%-22,9%; есть снижение ставки |
+| квартиры, апартаменты. Не принимаются: частный дом, дача | квартиры, апартаменты |
+| упоминается косвенно: допускаются объекты в ЗАТО | допускаются объекты в ЗАТО |
+| Ежемесячные аннуитетные равные платежи; график фиксирует даты | Ежемесячные аннуитетные равные платежи |
+
+---
+
+### 🧱 Структура вывода:
+
+* Сохрани структуру таблицы: строки — параметры, столбцы — банки.
+* Формат вывода: таблица в Markdown.
+* Не сокращай названия параметров в первом столбце.
+* Максимально сожми содержимое ячеек.
+* Не добавляй новые данные.
+* Не меняй факты.
+* Не удаляй строки и столбцы.
+* Если данные отсутствуют или указаны как НД, оставь "Не указано".
+* Верни только Markdown-таблицу без пояснений, без вступления и без ```.
+
+---
+
+### 📌 Дополнительно:
+
+Если есть несколько программ с разными ставками, оставь только диапазон и краткое пояснение, например:
+`19,9%-33,9%; разные программы`
+или
+`12,3%-32,9%; есть снижение ставки`.
+
+---
+
+### ТАБЛИЦА ДЛЯ УНИФИКАЦИИ:
+
+{markdown_table}
+"""
+
+
+# =========================
+# LLM / JSON
+# =========================
+
 def extract_llm_text(response) -> str | None:
     try:
         if hasattr(response, "output_text") and response.output_text:
@@ -730,15 +853,15 @@ def extract_llm_text(response) -> str | None:
     return None
 
 
-def call_llm(prompt: str):
+def call_llm(prompt: str, max_output_tokens: int = 3000, temperature: float = 0.1):
     if client is None:
         raise RuntimeError("LLM client is not initialized. Check YANDEX_FOLDER and YANDEX_API_KEY.")
 
     return client.responses.create(
         model=f"gpt://{YANDEX_FOLDER}/{YANDEX_MODEL}",
-        temperature=0.1,
+        temperature=temperature,
         input=prompt,
-        max_output_tokens=3000,
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -771,6 +894,39 @@ def parse_json_from_llm(raw_text: str) -> dict[str, Any]:
 
     return parsed
 
+
+def unify_table_with_llm(df: pd.DataFrame) -> str:
+    markdown_table = dataframe_to_markdown(df)
+
+    prompt = build_unification_prompt(markdown_table)
+
+    log(f"Unification markdown size: {len(markdown_table)}")
+    log(f"Unification prompt size: {len(prompt)}")
+
+    response = call_llm(
+        prompt=prompt,
+        max_output_tokens=6000,
+        temperature=0.1,
+    )
+
+    unified_table = extract_llm_text(response)
+
+    if not unified_table:
+        raise ValueError("LLM вернула пустую таблицу унификации")
+
+    unified_table = unified_table.strip()
+    unified_table = re.sub(r"^```markdown\s*", "", unified_table, flags=re.IGNORECASE)
+    unified_table = re.sub(r"^```\s*", "", unified_table)
+    unified_table = re.sub(r"\s*```$", "", unified_table)
+
+    log(f"Unified table preview:\n{unified_table[:1500]}")
+
+    return unified_table
+
+
+# =========================
+# RECORDS / TABLES
+# =========================
 
 def normalize_bank_record(
     battle_card_type: str,
@@ -874,7 +1030,7 @@ def build_comparison_table(records: list[dict[str, str]], battle_card_type: str)
 # PIPELINE
 # =========================
 
-def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFrame | None:
+def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> tuple[pd.DataFrame, str] | None:
     try:
         st.session_state.logs = []
         st.session_state.user_updates = []
@@ -892,16 +1048,15 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
         )
 
         records = []
-
         total_banks = len(selected_banks)
 
         for index, bank in enumerate(selected_banks, start=1):
             bank_name = bank["name"]
             bank_url = bank["url"]
 
-            base_progress = int(((index - 1) / max(total_banks, 1)) * 100)
-            parse_progress = min(base_progress + int(35 / max(total_banks, 1)), 95)
-            llm_progress = min(base_progress + int(70 / max(total_banks, 1)), 98)
+            base_progress = int(((index - 1) / max(total_banks, 1)) * 85)
+            parse_progress = min(base_progress + int(25 / max(total_banks, 1)), 90)
+            llm_progress = min(base_progress + int(55 / max(total_banks, 1)), 95)
 
             try:
                 st.session_state.progress_text = f"{bank_name}: сбор текста страницы."
@@ -925,6 +1080,7 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                 log(f"Final extracted text size: {text_size}")
 
                 st.session_state.progress_text = f"{bank_name}: текст собран, проверяю объём."
+
                 update_runtime_ui(
                     status=f"{bank_name}: текст страницы собран, проверяю пригодность для анализа.",
                     step="Проверка текста",
@@ -946,7 +1102,9 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                     )
 
                     st.session_state.completed_banks += 1
-                    add_user_update(f"{bank_name}: данных недостаточно, банк добавлен в таблицу со статусом ошибки.")
+                    add_user_update(
+                        f"{bank_name}: данных недостаточно, банк добавлен в таблицу со статусом ошибки."
+                    )
                     continue
 
                 limited_text = page_text[:70000]
@@ -955,6 +1113,7 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                     log(f"Text truncated for prompt: {len(page_text)} -> {len(limited_text)}")
 
                 st.session_state.progress_text = f"{bank_name}: извлекаю параметры через LLM."
+
                 update_runtime_ui(
                     status=f"{bank_name}: отправляю текст в LLM для извлечения параметров.",
                     step="LLM-анализ",
@@ -991,17 +1150,20 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                     )
 
                     st.session_state.completed_banks += 1
-                    add_user_update(f"{bank_name}: LLM вернула пустой ответ, банк добавлен в таблицу со статусом ошибки.")
+                    add_user_update(
+                        f"{bank_name}: LLM вернула пустой ответ, банк добавлен в таблицу со статусом ошибки."
+                    )
                     continue
 
                 log(f"LLM raw preview:\n{raw_text[:1000]}")
 
                 st.session_state.progress_text = f"{bank_name}: нормализую ответ и добавляю строку в таблицу."
+
                 update_runtime_ui(
                     status=f"{bank_name}: ответ LLM получен, собираю строку сравнительной таблицы.",
                     step="Сбор таблицы",
                     bank=bank_name,
-                    progress=min(llm_progress + 5, 99),
+                    progress=min(llm_progress + 5, 97),
                     user_message=f"{bank_name}: параметры получены, добавляю банк в итоговую таблицу.",
                 )
 
@@ -1034,11 +1196,14 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
                 )
 
                 st.session_state.completed_banks += 1
-                add_user_update(f"{bank_name}: возникла ошибка, банк добавлен в таблицу со статусом ошибки.")
+                add_user_update(
+                    f"{bank_name}: возникла ошибка, банк добавлен в таблицу со статусом ошибки."
+                )
 
             finally:
-                bank_done_progress = int((index / max(total_banks, 1)) * 100)
+                bank_done_progress = int((index / max(total_banks, 1)) * 85)
                 st.session_state.progress_text = f"Обработано банков: {index} из {total_banks}."
+
                 update_runtime_ui(
                     status=f"Завершил обработку банка: {bank_name}.",
                     step="Банк завершён",
@@ -1051,25 +1216,36 @@ def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> pd.DataFr
             return None
 
         update_runtime_ui(
-            status="Формирую итоговую сравнительную таблицу.",
+            status="Формирую первичную сравнительную таблицу.",
             step="Формирование таблицы",
             bank="—",
-            progress=99,
-            user_message="Все выбранные банки обработаны. Формирую единую сравнительную таблицу.",
+            progress=90,
+            user_message="Все выбранные банки обработаны. Формирую первичную таблицу параметров.",
         )
 
         comparison_df = build_comparison_table(records, battle_card_type)
 
-        st.session_state.progress_text = "Готово."
         update_runtime_ui(
-            status="Готово. Сравнительная таблица сформирована.",
+            status="Унифицирую формулировки в таблице.",
+            step="Унификация формулировок",
+            bank="—",
+            progress=95,
+            user_message="Запущен второй LLM-проход: формулировки приводятся к единому краткому стилю.",
+        )
+
+        unified_markdown_table = unify_table_with_llm(comparison_df)
+
+        st.session_state.progress_text = "Готово."
+
+        update_runtime_ui(
+            status="Готово. Унифицированная сравнительная таблица сформирована.",
             step="Готово",
             bank="—",
             progress=100,
-            user_message="Готово: сравнительная таблица сформирована.",
+            user_message="Готово: таблица сформирована и унифицирована.",
         )
 
-        return comparison_df
+        return comparison_df, unified_markdown_table
 
     except Exception:
         log("PIPELINE ERROR")
@@ -1090,8 +1266,8 @@ with top_right:
     render_logs_button()
 
 st.caption(
-    "На выходе формируется одна общая сравнительная таблица по выбранным банкам. "
-    "Во время ожидания приложение показывает текущий этап, банк, прогресс и краткие сообщения."
+    "На выходе формируется одна общая сравнительная таблица: параметры в строках, банки в столбцах. "
+    "После первичного извлечения запускается второй LLM-проход для унификации формулировок."
 )
 
 if client is None:
@@ -1126,21 +1302,27 @@ if st.button("Запустить анализ", type="primary"):
     if not selected_banks:
         st.error("Выбери хотя бы один банк.")
     else:
-        result_df = run_pipeline(battle_card_type, selected_banks)
+        result = run_pipeline(battle_card_type, selected_banks)
 
-        if result_df is not None and not result_df.empty:
+        if result is not None:
+            result_df, unified_markdown_table = result
+
             st.success("Готово")
-            st.subheader("Сравнительная таблица: параметры × банки")
-            st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+            st.subheader("Унифицированная сравнительная таблица")
+            st.markdown(unified_markdown_table)
 
             csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
 
             st.download_button(
-                label="Скачать CSV",
+                label="Скачать CSV с исходной структурированной таблицей",
                 data=csv_bytes,
                 file_name="bank_comparison_parameters_by_banks.csv",
                 mime="text/csv",
             )
+
+            with st.expander("Показать исходную таблицу до унификации"):
+                st.dataframe(result_df, use_container_width=True, hide_index=True)
+
         else:
             st.error("Получен пустой результат. Открой технические логи справа вверху.")
-
