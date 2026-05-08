@@ -5,7 +5,6 @@ import traceback
 import openai
 import requests
 import streamlit as st
-
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
@@ -16,57 +15,22 @@ from playwright.sync_api import sync_playwright
 
 PRODUCT_BANK_URLS = {
     "КНЗ: кредит под залог недвижимости": [
-        {
-            "name": "Сбер",
-            "url": "https://www.sberbank.ru/ru/person/credits/money/credit_zalog"
-        },
-        {
-            "name": "ВТБ",
-            "url": "https://www.vtb.ru/personal/ipoteka/ipoteka-pod-zalog-nedvizhimosti/"
-        },
-        {
-            "name": "Совкомбанк",
-            "url": "https://sovcombank.ru/credits/cash/alternativa"
-        },
-        {
-            "name": "МТС Банк",
-            "url": "https://www.mtsbank.ru/chastnim-licam/ipoteka/kredit-pod-zalog/"
-        },
-        {
-            "name": "Газпромбанк",
-            "url": "https://www.gazprombank.ru/personal/bail/pod-zalog/"
-        },
-        {
-            "name": "Альфа-Банк",
-            "url": "https://alfabank.ru/get-money/credit/pod-zalog/"
-        },
+        {"name": "Сбер", "url": "https://www.sberbank.ru/ru/person/credits/money/credit_zalog"},
+        {"name": "ВТБ", "url": "https://www.vtb.ru/personal/ipoteka/ipoteka-pod-zalog-nedvizhimosti/"},
+        {"name": "Совкомбанк", "url": "https://sovcombank.ru/credits/cash/alternativa"},
+        {"name": "МТС Банк", "url": "https://www.mtsbank.ru/chastnim-licam/ipoteka/kredit-pod-zalog/"},
+        {"name": "Газпромбанк", "url": "https://www.gazprombank.ru/personal/bail/pod-zalog/"},
+        {"name": "Альфа-Банк", "url": "https://alfabank.ru/get-money/credit/pod-zalog/"},
     ],
-
     "КНА: кредит под залог автомобиля": [
-        {
-            "name": "Т-Банк",
-            "url": "https://www.tbank.ru/loans/cash-loan/auto/"
-        },
-        {
-            "name": "Совкомбанк",
-            "url": "https://sovcombank.ru/credits/cash/pod-zalog-avto-"
-        },
-        {
-            "name": "ВТБ",
-            "url": "https://www.vtb.ru/personal/kredit/pod-zalog-avto/"
-        },
+        {"name": "Т-Банк", "url": "https://www.tbank.ru/loans/cash-loan/auto/"},
+        {"name": "Совкомбанк", "url": "https://sovcombank.ru/credits/cash/pod-zalog-avto-"},
+        {"name": "ВТБ", "url": "https://www.vtb.ru/personal/kredit/pod-zalog-avto/"},
     ],
-
     "Кредит наличными": [
-        {
-            "name": "Сбер",
-            "url": "https://www.sberbank.ru"
-        },
-        {
-            "name": "ВТБ",
-            "url": "https://www.vtb.ru"
-        },
-    ]
+        {"name": "Сбер", "url": "https://www.sberbank.ru"},
+        {"name": "ВТБ", "url": "https://www.vtb.ru"},
+    ],
 }
 
 
@@ -83,10 +47,7 @@ YANDEX_MODEL = os.getenv("YANDEX_MODEL", "gpt-oss-120b/latest")
 # STREAMLIT CONFIG
 # =========================
 
-st.set_page_config(
-    page_title="Battle Cards",
-    layout="wide"
-)
+st.set_page_config(page_title="Battle Cards", layout="wide")
 
 
 # =========================
@@ -101,38 +62,29 @@ if "status" not in st.session_state:
 
 
 # =========================
-# LOGGING
+# LOGGING / STATUS
 # =========================
 
-def log(message):
+def log(message: str) -> None:
     ts = time.strftime("%H:%M:%S")
     st.session_state.logs.append(f"[{ts}] {message}")
 
 
-def render_logs():
+def render_logs() -> None:
     st.subheader("Логи")
+    st.code("\n".join(st.session_state.logs[-700:]))
 
-    logs_text = "\n".join(
-        st.session_state.logs[-700:]
-    )
-
-    st.code(logs_text)
-
-
-# =========================
-# STATUS
-# =========================
 
 status_box = st.empty()
 
 
-def set_status(message):
+def set_status(message: str) -> None:
     st.session_state.status = message
     status_box.info(f"Статус: {message}")
 
 
 # =========================
-# ENV CHECK
+# ENV CHECK / LLM CLIENT
 # =========================
 
 if not YANDEX_FOLDER or not YANDEX_API_KEY:
@@ -144,22 +96,40 @@ if not YANDEX_FOLDER or not YANDEX_API_KEY:
     st.stop()
 
 
-# =========================
-# LLM CLIENT
-# =========================
-
 client = openai.OpenAI(
     api_key=YANDEX_API_KEY,
     base_url="https://ai.api.cloud.yandex.net/v1",
-    project=YANDEX_FOLDER
+    project=YANDEX_FOLDER,
 )
 
 
 # =========================
-# TEXT QUALITY CHECK
+# TEXT UTILS
 # =========================
 
-def is_bad_text(text):
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+
+    lines = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            lines.append(line)
+
+    deduped = []
+    prev = None
+
+    for line in lines:
+        if line != prev:
+            deduped.append(line)
+        prev = line
+
+    return "\n".join(deduped)
+
+
+def is_bad_text(text: str) -> bool:
     if not text:
         return True
 
@@ -180,92 +150,52 @@ def is_bad_text(text):
         "Рґ",
         "Р»",
         "Рє",
-        "Р"
     ]
 
-    bad_count = sum(
-        clean.count(fragment)
-        for fragment in bad_fragments
-    )
+    bad_count = sum(clean.count(fragment) for fragment in bad_fragments)
 
-    if bad_count > 20:
-        return True
-
-    return False
+    return bad_count > 20
 
 
 # =========================
 # REQUESTS PARSER
 # =========================
 
-def fetch_html_requests(url):
+def fetch_html_requests(url: str) -> str:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0.0.0 Safari/537.36"
         ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=40
-    )
-
+    response = requests.get(url, headers=headers, timeout=40)
     response.raise_for_status()
 
-    if not response.encoding or response.encoding.lower() in [
-        "iso-8859-1",
-        "ascii"
-    ]:
+    if not response.encoding or response.encoding.lower() in ["iso-8859-1", "ascii"]:
         response.encoding = response.apparent_encoding
 
     return response.text
 
 
-def extract_text_from_html(html):
+def extract_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    for tag in soup([
-        "script",
-        "style",
-        "noscript",
-        "svg",
-        "iframe",
-        "canvas"
-    ]):
+    for tag in soup(["script", "style", "noscript", "svg", "iframe", "canvas"]):
         tag.decompose()
 
-    text = soup.get_text(separator="\n")
-
-    cleaned_lines = []
-
-    for line in text.splitlines():
-        line = line.strip()
-
-        if line:
-            cleaned_lines.append(line)
-
-    final_text = "\n".join(cleaned_lines)
-
-    return final_text
+    return normalize_text(soup.get_text(separator="\n"))
 
 
-def get_text_with_requests(url):
+def get_text_with_requests(url: str) -> str:
     html = fetch_html_requests(url)
-
     log(f"Requests HTML size: {len(html)}")
 
     text = extract_text_from_html(html)
-
     log(f"Requests extracted text size: {len(text)}")
     log(f"Requests preview:\n{text[:1200] if text else 'EMPTY'}")
 
@@ -276,7 +206,7 @@ def get_text_with_requests(url):
 # PLAYWRIGHT PARSER
 # =========================
 
-def safe_click_locator(locator, timeout=1000):
+def safe_click_locator(locator, timeout: int = 1000) -> bool:
     try:
         if locator.is_visible():
             locator.click(timeout=timeout)
@@ -287,7 +217,7 @@ def safe_click_locator(locator, timeout=1000):
     return False
 
 
-def close_popups_and_cookies(page):
+def close_popups_and_cookies(page) -> None:
     close_texts = [
         "Принять",
         "Принять все",
@@ -298,7 +228,7 @@ def close_popups_and_cookies(page):
         "Закрыть",
         "Не сейчас",
         "ОК",
-        "OK"
+        "OK",
     ]
 
     for text in close_texts:
@@ -307,15 +237,11 @@ def close_popups_and_cookies(page):
             count = elements.count()
 
             for i in range(min(count, 7)):
-                try:
-                    element = elements.nth(i)
+                element = elements.nth(i)
 
-                    if safe_click_locator(element, timeout=1200):
-                        page.wait_for_timeout(500)
-                        log(f"Closed popup/cookie by text: {text}")
-
-                except Exception:
-                    pass
+                if safe_click_locator(element, timeout=1200):
+                    page.wait_for_timeout(500)
+                    log(f"Closed popup/cookie by text: {text}")
 
         except Exception:
             pass
@@ -325,7 +251,7 @@ def close_popups_and_cookies(page):
         "button[aria-label='Close']",
         "[data-testid*='close']",
         "[class*='close']",
-        "[class*='Close']"
+        "[class*='Close']",
     ]
 
     for selector in close_selectors:
@@ -334,21 +260,17 @@ def close_popups_and_cookies(page):
             count = elements.count()
 
             for i in range(min(count, 5)):
-                try:
-                    element = elements.nth(i)
+                element = elements.nth(i)
 
-                    if safe_click_locator(element, timeout=1000):
-                        page.wait_for_timeout(400)
-                        log(f"Closed popup by selector: {selector}")
-
-                except Exception:
-                    pass
+                if safe_click_locator(element, timeout=1000):
+                    page.wait_for_timeout(400)
+                    log(f"Closed popup by selector: {selector}")
 
         except Exception:
             pass
 
 
-def click_by_visible_texts(page):
+def click_by_visible_texts(page) -> int:
     click_texts = [
         "Показать ещё",
         "Показать еще",
@@ -372,7 +294,7 @@ def click_by_visible_texts(page):
         "Смотреть ещё",
         "Смотреть еще",
         "Читать далее",
-        "Развернуть все"
+        "Развернуть все",
     ]
 
     clicked_total = 0
@@ -383,16 +305,12 @@ def click_by_visible_texts(page):
             count = elements.count()
 
             for i in range(min(count, 12)):
-                try:
-                    element = elements.nth(i)
+                element = elements.nth(i)
 
-                    if safe_click_locator(element, timeout=1200):
-                        clicked_total += 1
-                        page.wait_for_timeout(500)
-                        log(f"Clicked by text: {text}")
-
-                except Exception:
-                    pass
+                if safe_click_locator(element, timeout=1200):
+                    clicked_total += 1
+                    page.wait_for_timeout(500)
+                    log(f"Clicked by text: {text}")
 
         except Exception:
             pass
@@ -400,7 +318,7 @@ def click_by_visible_texts(page):
     return clicked_total
 
 
-def click_accordion_selectors(page):
+def click_accordion_selectors(page) -> int:
     selectors = [
         "summary",
         "[role='button']",
@@ -413,7 +331,17 @@ def click_accordion_selectors(page):
         "[class*='collapse']",
         "[class*='Collapse']",
         "[class*='faq']",
-        "[class*='Faq']"
+        "[class*='Faq']",
+    ]
+
+    skip_words = [
+        "оформить",
+        "оставить заявку",
+        "получить кредит",
+        "войти",
+        "личный кабинет",
+        "скачать",
+        "позвонить",
     ]
 
     clicked_total = 0
@@ -424,36 +352,19 @@ def click_accordion_selectors(page):
             count = elements.count()
 
             for i in range(min(count, 45)):
+                element = elements.nth(i)
+
                 try:
-                    element = elements.nth(i)
-
-                    text = ""
-                    try:
-                        text = element.inner_text(timeout=500).strip()
-                    except Exception:
-                        pass
-
-                    skip_words = [
-                        "оформить",
-                        "оставить заявку",
-                        "получить кредит",
-                        "войти",
-                        "личный кабинет",
-                        "скачать",
-                        "позвонить"
-                    ]
-
-                    lowered = text.lower()
-
-                    if any(word in lowered for word in skip_words):
-                        continue
-
-                    if safe_click_locator(element, timeout=900):
-                        clicked_total += 1
-                        page.wait_for_timeout(250)
-
+                    element_text = element.inner_text(timeout=500).strip().lower()
                 except Exception:
-                    pass
+                    element_text = ""
+
+                if any(word in element_text for word in skip_words):
+                    continue
+
+                if safe_click_locator(element, timeout=900):
+                    clicked_total += 1
+                    page.wait_for_timeout(250)
 
         except Exception:
             pass
@@ -464,13 +375,13 @@ def click_accordion_selectors(page):
     return clicked_total
 
 
-def scroll_page(page, steps=6, pixels=2200):
+def scroll_page(page, steps: int = 6, pixels: int = 2200) -> None:
     for _ in range(steps):
         page.mouse.wheel(0, pixels)
         page.wait_for_timeout(700)
 
 
-def fetch_text_playwright(url):
+def fetch_text_playwright(url: str) -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -478,8 +389,8 @@ def fetch_text_playwright(url):
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-setuid-sandbox"
-            ]
+                "--disable-setuid-sandbox",
+            ],
         )
 
         context = browser.new_context(
@@ -489,25 +400,16 @@ def fetch_text_playwright(url):
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/122.0.0.0 Safari/537.36"
             ),
-            viewport={
-                "width": 1440,
-                "height": 1400
-            },
-            ignore_https_errors=True
+            viewport={"width": 1440, "height": 1400},
+            ignore_https_errors=True,
         )
 
         page = context.new_page()
-
         page.set_default_timeout(10000)
 
         log("Playwright: opening page")
 
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
-
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
 
         try:
@@ -516,9 +418,7 @@ def fetch_text_playwright(url):
             log("Playwright: networkidle timeout, continue anyway")
 
         close_popups_and_cookies(page)
-
         scroll_page(page, steps=5, pixels=2200)
-
         close_popups_and_cookies(page)
 
         click_by_visible_texts(page)
@@ -528,7 +428,6 @@ def fetch_text_playwright(url):
             log(f"Playwright interaction round: {round_num + 1}")
 
             scroll_page(page, steps=3, pixels=2600)
-
             close_popups_and_cookies(page)
 
             clicked_texts = click_by_visible_texts(page)
@@ -549,50 +448,15 @@ def fetch_text_playwright(url):
         context.close()
         browser.close()
 
-        text = normalize_text(text)
-
-        return text
+        return normalize_text(text)
 
 
-# =========================
-# TEXT NORMALIZATION
-# =========================
-
-def normalize_text(text):
-    if not text:
-        return ""
-
-    lines = []
-
-    for line in text.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        lines.append(line)
-
-    # Убираем подряд идущие дубли строк.
-    deduped = []
-    prev = None
-
-    for line in lines:
-        if line != prev:
-            deduped.append(line)
-
-        prev = line
-
-    return "\n".join(deduped)
-
-
-def get_page_text(url):
+def get_page_text(url: str) -> str:
     text = ""
 
     try:
         log("Trying requests parser")
-
         text = get_text_with_requests(url)
-
         text = normalize_text(text)
 
     except Exception:
@@ -604,7 +468,6 @@ def get_page_text(url):
 
         try:
             text = fetch_text_playwright(url)
-
             log(f"Playwright extracted text size: {len(text)}")
             log(f"Playwright preview:\n{text[:1800] if text else 'EMPTY'}")
 
@@ -619,10 +482,10 @@ def get_page_text(url):
 
 
 # =========================
-# PROMPT STRUCTURE
+# PROMPTS
 # =========================
 
-def get_structure(battle_card_type):
+def get_structure(battle_card_type: str) -> str:
     if battle_card_type == "КНЗ: кредит под залог недвижимости":
         return """
 ## Основные параметры кредита
@@ -698,21 +561,15 @@ def get_structure(battle_card_type):
 """
 
 
-# =========================
-# PROMPT
-# =========================
-
 def build_prompt(
-    battle_card_type,
-    bank_name,
-    url,
-    source_text
-):
-    structure = get_structure(
-        battle_card_type
-    )
+    battle_card_type: str,
+    bank_name: str,
+    url: str,
+    source_text: str,
+) -> str:
+    structure = get_structure(battle_card_type)
 
-    prompt = f"""
+    return f"""
 ТЫ — аналитик по банковским продуктам.
 
 ЗАДАЧА:
@@ -746,35 +603,21 @@ URL:
 {source_text}
 """
 
-    return prompt
-
 
 # =========================
-# SAFE RESPONSE PARSER
+# LLM
 # =========================
 
-def extract_llm_text(response):
+def extract_llm_text(response) -> str | None:
     try:
-        if (
-            hasattr(response, "output_text")
-            and response.output_text
-        ):
+        if hasattr(response, "output_text") and response.output_text:
             return response.output_text
 
-        if (
-            hasattr(response, "output")
-            and response.output
-        ):
+        if hasattr(response, "output") and response.output:
             for item in response.output:
-                if (
-                    hasattr(item, "content")
-                    and item.content
-                ):
+                if hasattr(item, "content") and item.content:
                     for content in item.content:
-                        if (
-                            hasattr(content, "text")
-                            and content.text
-                        ):
+                        if hasattr(content, "text") and content.text:
                             return content.text
 
     except Exception:
@@ -783,36 +626,22 @@ def extract_llm_text(response):
     return None
 
 
-# =========================
-# LLM CALL
-# =========================
-
-def call_llm(prompt):
-    response = client.responses.create(
-        model=(
-            f"gpt://"
-            f"{YANDEX_FOLDER}/"
-            f"{YANDEX_MODEL}"
-        ),
+def call_llm(prompt: str):
+    return client.responses.create(
+        model=f"gpt://{YANDEX_FOLDER}/{YANDEX_MODEL}",
         temperature=0.2,
         input=prompt,
-        max_output_tokens=3000
+        max_output_tokens=3000,
     )
-
-    return response
 
 
 # =========================
 # PIPELINE
 # =========================
 
-def run_pipeline(
-    battle_card_type,
-    selected_banks
-):
+def run_pipeline(battle_card_type: str, selected_banks: list[dict]) -> str | None:
     try:
         st.session_state.logs = []
-
         set_status("Запуск")
 
         all_results = []
@@ -822,37 +651,20 @@ def run_pipeline(
                 bank_name = bank["name"]
                 bank_url = bank["url"]
 
-                set_status(
-                    f"Парсинг: {bank_name}"
-                )
+                set_status(f"Парсинг: {bank_name}")
 
                 log("=" * 80)
                 log(f"START: {bank_name}")
                 log(f"URL: {bank_url}")
 
-                page_text = get_page_text(
-                    bank_url
-                )
-
-                page_text = normalize_text(
-                    page_text
-                )
+                page_text = get_page_text(bank_url)
+                page_text = normalize_text(page_text)
 
                 text_size = len(page_text) if page_text else 0
+                log(f"Final extracted text size: {text_size}")
 
-                log(
-                    f"Final extracted text size: "
-                    f"{text_size}"
-                )
-
-                if (
-                    not page_text
-                    or len(page_text.strip()) < 1000
-                ):
-                    log(
-                        f"TEXT TOO SMALL AFTER ALL PARSERS: "
-                        f"{bank_name} ({text_size})"
-                    )
+                if not page_text or len(page_text.strip()) < 1000:
+                    log(f"TEXT TOO SMALL AFTER ALL PARSERS: {bank_name} ({text_size})")
 
                     all_results.append(
                         f"""
@@ -865,49 +677,30 @@ def run_pipeline(
 URL: {bank_url}
 """
                     )
-
                     continue
 
                 limited_text = page_text[:70000]
 
                 if len(page_text) > len(limited_text):
-                    log(
-                        f"Text truncated for prompt: "
-                        f"{len(page_text)} -> {len(limited_text)}"
-                    )
+                    log(f"Text truncated for prompt: {len(page_text)} -> {len(limited_text)}")
 
                 prompt = build_prompt(
-                    battle_card_type,
-                    bank_name,
-                    bank_url,
-                    limited_text
+                    battle_card_type=battle_card_type,
+                    bank_name=bank_name,
+                    url=bank_url,
+                    source_text=limited_text,
                 )
 
-                log(
-                    f"Prompt size: "
-                    f"{len(prompt)}"
-                )
-
-                set_status(
-                    f"LLM-анализ: {bank_name}"
-                )
+                log(f"Prompt size: {len(prompt)}")
+                set_status(f"LLM-анализ: {bank_name}")
 
                 response = call_llm(prompt)
+                log("LLM response received")
 
-                log(
-                    "LLM response received"
-                )
-
-                result_text = extract_llm_text(
-                    response
-                )
+                result_text = extract_llm_text(response)
 
                 if not result_text:
-                    log(
-                        f"EMPTY OUTPUT: "
-                        f"{bank_name}"
-                    )
-
+                    log(f"EMPTY OUTPUT: {bank_name}")
                     log(str(response))
 
                     all_results.append(
@@ -919,22 +712,15 @@ LLM вернула пустой ответ.
 URL: {bank_url}
 """
                     )
-
                     continue
 
-                all_results.append(
-                    result_text
-                )
+                all_results.append(result_text)
 
             except Exception:
-                log(
-                    f"ERROR BANK: "
-                    f"{bank.get('name', 'UNKNOWN')}"
-                )
+                err = traceback.format_exc()
 
-                log(
-                    traceback.format_exc()
-                )
+                log(f"ERROR BANK: {bank.get('name', 'UNKNOWN')}")
+                log(err)
 
                 all_results.append(
                     f"""
@@ -943,82 +729,68 @@ URL: {bank_url}
 Ошибка обработки банка.
 
 ```text
-{traceback.format_exc()}
-
+{err}
+```
 """
-)
+                )
 
-    if not all_results:
-        log("NO RESULTS")
+        if not all_results:
+            log("NO RESULTS")
+            return None
 
+        final_report = "\n\n---\n\n".join(all_results)
+        set_status("Готово")
+
+        return final_report
+
+    except Exception:
+        log("PIPELINE ERROR")
+        log(traceback.format_exc())
         return None
 
-    final_report = (
-        "\n\n---\n\n"
-        .join(all_results)
-    )
 
-    set_status("Готово")
-
-    return final_report
-
-except Exception:
-    log("PIPELINE ERROR")
-    log(traceback.format_exc())
-
-    return None
-=========================
-UI
-=========================
+# =========================
+# UI
+# =========================
 
 st.title("Battle Cards Generator")
 
 st.caption(
-"Парсер сначала пробует requests, затем при слабом результате запускает "
-"Playwright: открывает страницу в headless-браузере, кликает раскрывающиеся "
-"элементы и собирает текст."
+    "Парсер сначала пробует requests, затем при слабом результате запускает "
+    "Playwright: открывает страницу в headless-браузере, кликает раскрывающиеся "
+    "элементы и собирает текст."
 )
 
 battle_card_type = st.selectbox(
-"Тип баттл-карты",
-list(PRODUCT_BANK_URLS.keys())
+    "Тип баттл-карты",
+    list(PRODUCT_BANK_URLS.keys()),
 )
 
-banks = PRODUCT_BANK_URLS[
-battle_card_type
-]
+banks = PRODUCT_BANK_URLS[battle_card_type]
 
 selected_bank_names = st.multiselect(
-"Банки",
-[b["name"] for b in banks],
-default=[b["name"] for b in banks]
+    "Банки",
+    [b["name"] for b in banks],
+    default=[b["name"] for b in banks],
 )
 
 selected_banks = [
-b
-for b in banks
-if b["name"] in selected_bank_names
+    b
+    for b in banks
+    if b["name"] in selected_bank_names
 ]
 
 with st.expander("Текущие URL"):
-for bank in selected_banks:
-st.write(
-f"{bank['name']} — {bank['url']}"
-)
+    for bank in selected_banks:
+        st.write(f"**{bank['name']}** — {bank['url']}")
 
 if st.button("Запустить анализ"):
-result = run_pipeline(
-battle_card_type,
-selected_banks
-)
+    result = run_pipeline(battle_card_type, selected_banks)
 
-if result:
-    st.success("Готово")
-    st.markdown(result)
-else:
-    st.error(
-        "Получен пустой результат. "
-        "Смотри логи."
-    )
+    if result:
+        st.success("Готово")
+        st.markdown(result)
+    else:
+        st.error("Получен пустой результат. Смотри логи.")
 
 render_logs()
