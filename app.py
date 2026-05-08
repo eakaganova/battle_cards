@@ -79,7 +79,7 @@ def scrape_text(url: str) -> str:
 
     text = soup.get_text(" ", strip=True)
 
-    return text[:3000]
+    return text[:300000]
 
 
 # -----------------------
@@ -122,7 +122,7 @@ if st.button("Запустить"):
         response = client.responses.create(
             model=model,
             temperature=0.3,
-            max_output_tokens=500,
+            max_output_tokens=5000000,
             instructions=prompt,
             input=text
         )
