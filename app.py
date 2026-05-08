@@ -7,7 +7,6 @@ import re
 import time
 import traceback
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin, urlparse
 
 import openai
 import pandas as pd
@@ -15,11 +14,6 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
 
 
 # =========================
@@ -132,14 +126,9 @@ YANDEX_MODEL = os.getenv("YANDEX_MODEL", "gpt-oss-120b/latest")
 
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 
-MAX_SOURCE_CHARS = 35000
-REQUESTS_TIMEOUT = 8
-PLAYWRIGHT_TIMEOUT = 25000
-
-MAX_CLICK_ELEMENTS = 45
-MAX_PDF_FILES = 8
-MAX_PDF_PAGES = 20
-MAX_TEXT_BLOCKS = 90
+MAX_SOURCE_CHARS = 25000
+REQUESTS_TIMEOUT = 20
+PLAYWRIGHT_TIMEOUT = 45000
 
 
 # =========================
@@ -168,17 +157,12 @@ defaults = {
     "user_updates": [],
     "custom_params_text": "\n".join(DEFAULT_CUSTOM_PARAMS),
     "custom_companies": [
-        {"name": "", "url": "", "manual_text": ""},
-        {"name": "", "url": "", "manual_text": ""},
-        {"name": "", "url": "", "manual_text": ""},
+        {"name": "", "url": ""},
+        {"name": "", "url": ""},
+        {"name": "", "url": ""},
     ],
     "last_df": None,
     "last_raw_records": [],
-    "pending_manual_requests": [],
-    "pipeline_context": None,
-    "base_records": [],
-    "manual_records": [],
-    "last_columns": [],
 }
 
 for key, value in defaults.items():
@@ -187,7 +171,7 @@ for key, value in defaults.items():
 
 
 # =========================
-# LOGGING / UI HELPERS
+# LOGGING / STATE HELPERS
 # =========================
 
 def log(message: str) -> None:
@@ -200,7 +184,7 @@ def add_user_update(message: str) -> None:
     st.session_state.user_updates.append(f"[{timestamp}] {message}")
 
 
-def update_runtime_ui(
+def update_runtime_state(
     status: Optional[str] = None,
     step: Optional[str] = None,
     company: Optional[str] = None,
@@ -232,14 +216,106 @@ def reset_runtime_state() -> None:
     st.session_state.user_updates = []
     st.session_state.last_df = None
     st.session_state.last_raw_records = []
-    st.session_state.pending_manual_requests = []
-    st.session_state.pipeline_context = None
-    st.session_state.base_records = []
-    st.session_state.manual_records = []
-    st.session_state.last_columns = []
 
 
-def render_runtime_panel() -> None:
+# =========================
+# LIVE STATUS UI
+# =========================
+
+def init_live_ui() -> Dict[str, Any]:
+    """
+    Создаёт контейнеры, которые обновляются прямо во время выполнения пайплайна.
+    """
+    return {
+        "status_box": st.empty(),
+        "progress_bar": st.empty(),
+        "metrics_box": st.empty(),
+        "steps_box": st.empty(),
+        "events_box": st.empty(),
+        "log_box": st.empty(),
+    }
+
+
+def render_live_status(
+    ui: Dict[str, Any],
+    status: str,
+    step: str,
+    company: str,
+    progress: int,
+    completed: int,
+    total: int,
+    started_at: float,
+    last_event: str = "",
+) -> None:
+    """
+    Принудительно перерисовывает live-статус выполнения.
+    """
+    elapsed = int(time.time() - started_at)
+    minutes = elapsed // 60
+    seconds = elapsed % 60
+
+    progress = max(0, min(100, int(progress)))
+
+    update_runtime_state(
+        status=status,
+        step=step,
+        company=company,
+        progress=progress,
+        user_message=last_event if last_event else None,
+    )
+
+    ui["status_box"].info(
+        f"**Статус:** {status}\n\n"
+        f"**Сейчас:** {step}\n\n"
+        f"**Объект:** {company}\n\n"
+        f"**Последнее событие:** {last_event or '—'}\n\n"
+        f"**Время выполнения:** {minutes:02d}:{seconds:02d}"
+    )
+
+    ui["progress_bar"].progress(progress, text=f"{progress}%")
+
+    with ui["metrics_box"].container():
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Обработано", f"{completed} / {total}")
+        col2.metric("Текущий этап", step)
+        col3.metric("Текущий объект", company)
+        col4.metric("Время", f"{minutes:02d}:{seconds:02d}")
+
+    steps = [
+        "Подготовка списка компаний и параметров",
+        "Парсинг страницы",
+        "Извлечение параметров через LLM",
+        "Нормализация записи",
+        "Компания обработана",
+        "Унификация общей таблицы",
+        "Формирование файла",
+        "Завершено",
+    ]
+
+    with ui["steps_box"].container():
+        st.write("### Ход выполнения")
+        for index, step_name in enumerate(steps, start=1):
+            if step_name == step:
+                st.write(f"▶️ **{index}. {step_name}**")
+            else:
+                st.write(f"▫️ {index}. {step_name}")
+
+    with ui["events_box"].expander("Последние события", expanded=True):
+        if st.session_state.user_updates:
+            for item in st.session_state.user_updates[-12:]:
+                st.write(item)
+        else:
+            st.write("Пока нет событий.")
+
+    with ui["log_box"].expander("Технические логи", expanded=False):
+        if st.session_state.logs:
+            for item in st.session_state.logs[-80:]:
+                st.code(item)
+        else:
+            st.write("Пока нет логов.")
+
+
+def render_static_runtime_panel() -> None:
     st.info(st.session_state.status)
     st.progress(
         st.session_state.progress_value,
@@ -256,14 +332,14 @@ def render_runtime_panel() -> None:
 
     with st.expander("Ход процесса", expanded=True):
         if st.session_state.user_updates:
-            for item in st.session_state.user_updates[-15:]:
+            for item in st.session_state.user_updates[-10:]:
                 st.write(item)
         else:
             st.write("Пока нет событий.")
 
     with st.expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-300:]:
+            for item in st.session_state.logs[-100:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -288,39 +364,6 @@ def clean_text(text: str) -> str:
             lines.append(line)
 
     return "\n".join(lines)
-
-
-def normalize_space(text: str) -> str:
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def text_fingerprint(text: str, limit: int = 500) -> str:
-    return normalize_space(text.lower())[:limit]
-
-
-def add_text_block(
-    blocks: List[str],
-    title: str,
-    content: str,
-    seen: set,
-    min_len: int = 40,
-) -> bool:
-    content = clean_text(content)
-
-    if len(content) < min_len:
-        return False
-
-    fp = text_fingerprint(content)
-
-    if not fp or fp in seen:
-        return False
-
-    seen.add(fp)
-    blocks.append(f"\n\n--- {title} ---\n{content}")
-
-    return True
 
 
 def parse_params_from_text(text: str) -> List[str]:
@@ -365,12 +408,8 @@ def deduplicate_companies(companies: List[Dict[str, str]]) -> List[Dict[str, str
     for company in companies:
         name = str(company.get("name", "")).strip()
         url = str(company.get("url", "")).strip()
-        manual_text = str(company.get("manual_text", "")).strip()
 
-        if not name:
-            continue
-
-        if not url and not manual_text:
+        if not name or not url:
             continue
 
         key = (name.lower(), url.lower())
@@ -378,13 +417,7 @@ def deduplicate_companies(companies: List[Dict[str, str]]) -> List[Dict[str, str
             continue
 
         seen.add(key)
-        result.append(
-            {
-                "name": name,
-                "url": url,
-                "manual_text": manual_text,
-            }
-        )
+        result.append({"name": name, "url": url})
 
     return result
 
@@ -512,555 +545,44 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def build_dataframe_from_records(
-    records: List[Dict[str, Any]],
-    params: List[str],
-) -> pd.DataFrame:
-    columns = ["Компания"] + params
-    df = pd.DataFrame(records)
-
-    for column in columns:
-        if column not in df.columns:
-            df[column] = "Не указано"
-
-    df = df[columns]
-    return df
-
-
 # =========================
-# PDF HELPERS
+# PARSERS
 # =========================
 
-def is_pdf_url(url: str) -> bool:
-    if not url:
-        return False
-
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-
-    if path.endswith(".pdf"):
-        return True
-
-    if ".pdf" in path:
-        return True
-
-    return False
-
-
-def safe_filename_from_url(url: str, fallback: str = "document.pdf") -> str:
-    try:
-        path = urlparse(url).path
-        name = os.path.basename(path)
-        name = name.split("?")[0].strip()
-        if not name:
-            return fallback
-        if not name.lower().endswith(".pdf"):
-            name += ".pdf"
-        return re.sub(r"[^a-zA-Zа-яА-Я0-9_\-.]+", "_", name)
-    except Exception:
-        return fallback
-
-
-def extract_text_from_pdf_bytes(pdf_bytes: bytes, filename: str) -> str:
-    if PdfReader is None:
-        return f"[PDF] {filename}: библиотека pypdf не установлена, текст PDF не извлечён."
-
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-
-        total_pages = len(reader.pages)
-        pages_to_read = min(total_pages, MAX_PDF_PAGES)
-
-        for page_index in range(pages_to_read):
-            try:
-                page_text = reader.pages[page_index].extract_text() or ""
-                page_text = clean_text(page_text)
-                if page_text:
-                    parts.append(f"\n[Страница {page_index + 1}]\n{page_text}")
-            except Exception as exc:
-                parts.append(f"\n[Страница {page_index + 1}] Ошибка извлечения текста: {repr(exc)}")
-
-        if not parts:
-            return f"[PDF] {filename}: текст не извлечён."
-
-        suffix = ""
-        if total_pages > pages_to_read:
-            suffix = f"\n\n[PDF] Прочитано {pages_to_read} страниц из {total_pages}."
-
-        return f"[PDF] {filename}\n" + "\n".join(parts) + suffix
-
-    except Exception as exc:
-        return f"[PDF] {filename}: ошибка чтения PDF: {repr(exc)}"
-
-
-def download_and_extract_pdf(pdf_url: str, page_url: str) -> str:
-    absolute_url = urljoin(page_url, pdf_url)
-    filename = safe_filename_from_url(absolute_url)
-
+def fetch_text_requests(url: str) -> str:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Accept": "application/pdf,application/octet-stream,*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        "Referer": page_url,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Connection": "keep-alive",
     }
 
     response = requests.get(
-        absolute_url,
+        url,
         headers=headers,
         timeout=REQUESTS_TIMEOUT,
         allow_redirects=True,
     )
+
     response.raise_for_status()
 
-    content_type = response.headers.get("Content-Type", "").lower()
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    if "pdf" not in content_type and not absolute_url.lower().endswith(".pdf"):
-        return f"[PDF] {filename}: ссылка не похожа на PDF после загрузки. Content-Type: {content_type}"
+    for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
+        tag.decompose()
 
-    log(f"[PDF] Скачан: {filename}")
+    text = soup.get_text("\n")
+    text = clean_text(text)
 
-    return extract_text_from_pdf_bytes(response.content, filename)
-
-
-# =========================
-# PARSERS: REQUESTS
-# =========================
-
-def fetch_text_requests(url: str) -> str:
-    session = requests.Session()
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-        ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Referer": "https://www.google.com/",
-    }
-
-    last_error = None
-
-    for attempt in range(2):
-        try:
-            response = session.get(
-                url,
-                headers=headers,
-                timeout=REQUESTS_TIMEOUT,
-                allow_redirects=True,
-            )
-
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
-                tag.decompose()
-
-            text = soup.get_text("\n")
-            text = clean_text(text)
-
-            return text
-
-        except Exception as exc:
-            last_error = exc
-            log(f"requests attempt {attempt + 1}/2 failed for {url}: {repr(exc)}")
-            time.sleep(1)
-
-    raise last_error
-
-
-# =========================
-# PARSERS: PLAYWRIGHT DEEP SCRAPE
-# =========================
-
-def safe_locator_count(page, selector: str) -> int:
-    try:
-        return page.locator(selector).count()
-    except Exception:
-        return 0
-
-
-def safe_get_body_text(page) -> str:
-    try:
-        return clean_text(page.locator("body").inner_text(timeout=8000))
-    except Exception as exc:
-        log(f"[BODY] Не удалось получить body text: {repr(exc)}")
-        return ""
-
-
-def safe_click_locator(locator, label: str) -> bool:
-    try:
-        locator.scroll_into_view_if_needed(timeout=5000)
-        time.sleep(0.25)
-
-        try:
-            locator.click(timeout=5000)
-        except Exception:
-            locator.evaluate("(el) => el.click()")
-
-        time.sleep(0.9)
-        log(f"[CLICK] {label}: клик выполнен")
-        return True
-
-    except Exception as exc:
-        log(f"[ОШИБКА] Не удалось кликнуть по {label}: {repr(exc)}")
-        return False
-
-
-def collect_pdf_links_from_page(page, base_url: str) -> List[str]:
-    urls = []
-
-    selectors = [
-        'a[href$=".pdf"]',
-        'a[href*=".pdf"]',
-        'a[data-test-id*="file"]',
-        'a[data-test-id*="File"]',
-        'a[href*="download"]',
-        'a[href*="documents"]',
-        'a[href*="files"]',
-    ]
-
-    for selector in selectors:
-        count = safe_locator_count(page, selector)
-
-        for i in range(min(count, 50)):
-            try:
-                href = page.locator(selector).nth(i).get_attribute("href")
-                if not href:
-                    continue
-
-                absolute = urljoin(base_url, href)
-
-                if is_pdf_url(absolute) and absolute not in urls:
-                    urls.append(absolute)
-
-            except Exception:
-                continue
-
-    return urls[:MAX_PDF_FILES]
-
-
-def collect_text_from_pdf_links(pdf_links: List[str], page_url: str) -> str:
-    pdf_texts = []
-
-    if not pdf_links:
-        return ""
-
-    log(f"[PDF] Найдено PDF-ссылок: {len(pdf_links)}")
-
-    for index, pdf_url in enumerate(pdf_links, start=1):
-        try:
-            log(f"[PDF #{index}] Пробую скачать: {pdf_url}")
-            pdf_text = download_and_extract_pdf(pdf_url, page_url)
-            pdf_texts.append(f"\n\n--- PDF #{index}: {pdf_url} ---\n{pdf_text}")
-        except Exception as exc:
-            log(f"[PDF #{index}] Ошибка при скачивании {pdf_url}: {repr(exc)}")
-            pdf_texts.append(f"\n\n--- PDF #{index}: {pdf_url} ---\nОшибка скачивания или чтения PDF: {repr(exc)}")
-
-    return "\n".join(pdf_texts)
-
-
-def click_accordions_and_collect(page, blocks: List[str], seen: set) -> None:
-    selectors = [
-        '[data-test-id^="accordion-header-"]',
-        '[data-testid^="accordion-header-"]',
-        '[role="button"][aria-expanded]',
-        'button[aria-expanded]',
-        'summary',
-        '[class*="accordion" i]',
-        '[class*="spoiler" i]',
-        '[class*="collapse" i]',
-    ]
-
-    clicked = 0
-
-    for selector in selectors:
-        count = safe_locator_count(page, selector)
-
-        if count == 0:
-            continue
-
-        log(f"[Аккордеоны] selector='{selector}', найдено: {count}")
-
-        for i in range(min(count, MAX_CLICK_ELEMENTS)):
-            if clicked >= MAX_CLICK_ELEMENTS:
-                return
-
-            try:
-                locator = page.locator(selector).nth(i)
-
-                try:
-                    if not locator.is_visible(timeout=1000):
-                        continue
-                except Exception:
-                    pass
-
-                label = f"Аккордеон #{clicked + 1}"
-
-                clicked_ok = safe_click_locator(locator, label)
-
-                if not clicked_ok:
-                    continue
-
-                text = safe_get_body_text(page)
-                added = add_text_block(
-                    blocks=blocks,
-                    title=label,
-                    content=text,
-                    seen=seen,
-                    min_len=120,
-                )
-
-                if added:
-                    log(f"[{label}] Текст записан")
-                else:
-                    log(f"[{label}] Текст не добавлен: дубль или мало текста")
-
-                clicked += 1
-
-            except Exception as exc:
-                log(f"[Аккордеон #{clicked + 1}] Ошибка: {repr(exc)}")
-
-
-def click_tabs_and_collect(page, blocks: List[str], seen: set) -> None:
-    selectors = [
-        '[role="tab"]',
-        '[data-test-id*="TabsHeader"]',
-        '[data-testid*="TabsHeader"]',
-        'button[class*="tab" i]',
-        '[class*="tabs"] button',
-        '[class*="tab"]',
-    ]
-
-    clicked = 0
-
-    for selector in selectors:
-        count = safe_locator_count(page, selector)
-
-        if count == 0:
-            continue
-
-        log(f"[Табы] selector='{selector}', найдено: {count}")
-
-        for i in range(min(count, MAX_CLICK_ELEMENTS)):
-            if clicked >= MAX_CLICK_ELEMENTS:
-                return
-
-            try:
-                locator = page.locator(selector).nth(i)
-
-                try:
-                    if not locator.is_visible(timeout=1000):
-                        continue
-                except Exception:
-                    pass
-
-                tab_text = ""
-                try:
-                    tab_text = normalize_space(locator.inner_text(timeout=1500))
-                except Exception:
-                    tab_text = ""
-
-                title = f"Таб #{clicked + 1}"
-                if tab_text:
-                    title = f"Таб #{clicked + 1}: {tab_text[:80]}"
-
-                clicked_ok = safe_click_locator(locator, title)
-
-                if not clicked_ok:
-                    continue
-
-                text = safe_get_body_text(page)
-                added = add_text_block(
-                    blocks=blocks,
-                    title=title,
-                    content=text,
-                    seen=seen,
-                    min_len=120,
-                )
-
-                if added:
-                    log(f"[{title}] Текст записан")
-                else:
-                    log(f"[{title}] Текст не добавлен: дубль или мало текста")
-
-                clicked += 1
-
-            except Exception as exc:
-                log(f"[Таб #{clicked + 1}] Ошибка: {repr(exc)}")
-
-
-def click_more_buttons_and_collect(page, blocks: List[str], seen: set) -> None:
-    labels_regex = re.compile(
-        r"(показать|раскрыть|развернуть|ещ[её]|подробнее|читать|условия|тариф|документ|требован|faq|вопрос)",
-        flags=re.IGNORECASE,
-    )
-
-    selectors = [
-        "button",
-        'a[role="button"]',
-        '[role="button"]',
-        'a[href="#"]',
-    ]
-
-    clicked = 0
-
-    for selector in selectors:
-        count = safe_locator_count(page, selector)
-
-        if count == 0:
-            continue
-
-        log(f"[Кнопки] selector='{selector}', найдено: {count}")
-
-        for i in range(min(count, 80)):
-            if clicked >= MAX_CLICK_ELEMENTS:
-                return
-
-            try:
-                locator = page.locator(selector).nth(i)
-
-                try:
-                    if not locator.is_visible(timeout=1000):
-                        continue
-                except Exception:
-                    pass
-
-                text = ""
-                try:
-                    text = normalize_space(locator.inner_text(timeout=1500))
-                except Exception:
-                    text = ""
-
-                aria = ""
-                try:
-                    aria = locator.get_attribute("aria-label") or ""
-                except Exception:
-                    aria = ""
-
-                test_id = ""
-                try:
-                    test_id = locator.get_attribute("data-test-id") or locator.get_attribute("data-testid") or ""
-                except Exception:
-                    test_id = ""
-
-                joined = " ".join([text, aria, test_id]).strip()
-
-                if not joined:
-                    continue
-
-                if not labels_regex.search(joined):
-                    continue
-
-                label = f"Кнопка #{clicked + 1}: {joined[:100]}"
-
-                clicked_ok = safe_click_locator(locator, label)
-
-                if not clicked_ok:
-                    continue
-
-                body_text = safe_get_body_text(page)
-                added = add_text_block(
-                    blocks=blocks,
-                    title=label,
-                    content=body_text,
-                    seen=seen,
-                    min_len=120,
-                )
-
-                if added:
-                    log(f"[{label}] Текст записан")
-                else:
-                    log(f"[{label}] Текст не добавлен: дубль или мало текста")
-
-                clicked += 1
-
-            except Exception as exc:
-                log(f"[Кнопка #{clicked + 1}] Ошибка: {repr(exc)}")
-
-
-def collect_structured_sections(page, blocks: List[str], seen: set) -> None:
-    selectors = [
-        "main",
-        "section",
-        "article",
-        '[data-widget-name]',
-        '[data-test-id]',
-        '[data-testid]',
-        "h1",
-        "h2",
-        "h3",
-    ]
-
-    added_count = 0
-
-    for selector in selectors:
-        count = safe_locator_count(page, selector)
-
-        if count == 0:
-            continue
-
-        log(f"[Секции] selector='{selector}', найдено: {count}")
-
-        for i in range(min(count, 40)):
-            if added_count >= MAX_TEXT_BLOCKS:
-                return
-
-            try:
-                locator = page.locator(selector).nth(i)
-
-                try:
-                    if not locator.is_visible(timeout=1000):
-                        continue
-                except Exception:
-                    pass
-
-                text = locator.inner_text(timeout=3000)
-                text = clean_text(text)
-
-                if not text:
-                    continue
-
-                title = f"Секция {selector} #{i + 1}"
-
-                added = add_text_block(
-                    blocks=blocks,
-                    title=title,
-                    content=text,
-                    seen=seen,
-                    min_len=80,
-                )
-
-                if added:
-                    added_count += 1
-                    log(f"[{title}] Текст записан")
-
-            except Exception:
-                continue
+    return text
 
 
 def fetch_text_playwright(url: str) -> str:
-    browser = None
-    context = None
-
-    blocks = []
-    seen = set()
-
     try:
-        log(f"Playwright: запускаю браузер для {url}")
-
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
@@ -1069,13 +591,8 @@ def fetch_text_playwright(url: str) -> str:
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-web-security",
-                    "--disable-features=IsolateOrigins,site-per-process",
                 ],
             )
-
-            log(f"Playwright: браузер запущен для {url}")
 
             context = browser.new_context(
                 user_agent=(
@@ -1085,104 +602,27 @@ def fetch_text_playwright(url: str) -> str:
                 ),
                 locale="ru-RU",
                 viewport={"width": 1440, "height": 1200},
-                extra_http_headers={
-                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-                },
-                ignore_https_errors=True,
             )
 
             page = context.new_page()
-            page.set_default_timeout(10000)
-            page.set_default_navigation_timeout(PLAYWRIGHT_TIMEOUT)
-
-            log(f"Playwright: открываю страницу {url}")
-
-            page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=PLAYWRIGHT_TIMEOUT,
-            )
-
-            log(f"Playwright: DOM загружен для {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
 
             try:
-                page.wait_for_load_state("networkidle", timeout=7000)
-                log(f"Playwright: networkidle получен для {url}")
+                page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
-                log(f"Playwright: networkidle не дождались, продолжаю для {url}")
-
-            page.wait_for_timeout(2500)
-
-            title = ""
-            current_url = ""
+                pass
 
             try:
-                title = page.title()
+                page.wait_for_timeout(3000)
             except Exception:
-                title = ""
+                pass
 
-            try:
-                current_url = page.url
-            except Exception:
-                current_url = ""
+            text = page.locator("body").inner_text(timeout=15000)
 
-            log(f"Playwright: title='{title}', current_url='{current_url}'")
+            context.close()
+            browser.close()
 
-            base_text = safe_get_body_text(page)
-            add_text_block(
-                blocks=blocks,
-                title="Базовый текст страницы",
-                content=base_text,
-                seen=seen,
-                min_len=100,
-            )
-            log(f"[Шаг 1] Базовый текст страницы: {len(base_text)} символов")
-
-            log("[Шаг 2] Сбор структурных секций")
-            collect_structured_sections(page, blocks, seen)
-
-            log("[Шаг 3] Аккордеоны")
-            click_accordions_and_collect(page, blocks, seen)
-
-            log("[Шаг 4] Табы")
-            click_tabs_and_collect(page, blocks, seen)
-
-            log("[Шаг 5] Кнопки раскрытия / подробнее")
-            click_more_buttons_and_collect(page, blocks, seen)
-
-            log("[Шаг 6] Повторный сбор структурных секций после кликов")
-            collect_structured_sections(page, blocks, seen)
-
-            log("[Шаг 7] Поиск PDF")
-            pdf_links = collect_pdf_links_from_page(page, current_url or url)
-
-            pdf_text = collect_text_from_pdf_links(pdf_links, current_url or url)
-            add_text_block(
-                blocks=blocks,
-                title="PDF-документы",
-                content=pdf_text,
-                seen=seen,
-                min_len=40,
-            )
-
-            final_text = clean_text("\n".join(blocks))
-
-            log(f"Playwright deep scrape: итоговый текст: {len(final_text)} символов")
-
-            if not final_text:
-                raise RuntimeError(
-                    f"Playwright открыл страницу, но итоговый текст пустой. "
-                    f"Title: {title}. Current URL: {current_url}"
-                )
-
-            if len(final_text) < 300:
-                raise RuntimeError(
-                    f"Playwright получил слишком мало текста: {len(final_text)} символов. "
-                    f"Title: {title}. Current URL: {current_url}. "
-                    f"Текст: {final_text[:500]}"
-                )
-
-            return final_text
+            return clean_text(text)
 
     except Exception as exc:
         error_text = str(exc)
@@ -1190,28 +630,20 @@ def fetch_text_playwright(url: str) -> str:
         if "Executable doesn't exist" in error_text or "playwright install" in error_text:
             raise RuntimeError(
                 "Playwright установлен, но браузер Chromium не скачан. "
-                "В Render добавьте build.sh с командой: "
-                "PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium. "
-                "После этого выполните Manual Deploy → Clear build cache & deploy."
+                "В Render нужно добавить Environment Variable: PLAYWRIGHT_BROWSERS_PATH=0, "
+                "а в build.sh команду: PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium. "
+                "После этого выполнить Manual Deploy → Clear build cache & deploy."
             ) from exc
 
         raise
 
-    finally:
-        try:
-            if context is not None:
-                context.close()
-        except Exception:
-            pass
 
-        try:
-            if browser is not None:
-                browser.close()
-        except Exception:
-            pass
-
-
-def get_page_text(url: str, company_name: str) -> Dict[str, Any]:
+def get_page_text(
+    url: str,
+    company_name: str,
+    live_ui: Optional[Dict[str, Any]] = None,
+    started_at: Optional[float] = None,
+) -> Dict[str, Any]:
     result = {
         "text": "",
         "method": "",
@@ -1221,6 +653,20 @@ def get_page_text(url: str, company_name: str) -> Dict[str, Any]:
 
     try:
         log(f"{company_name}: пробую requests: {url}")
+
+        if live_ui and started_at:
+            render_live_status(
+                ui=live_ui,
+                status=f"Анализ: {company_name}",
+                step="Парсинг страницы",
+                company=company_name,
+                progress=st.session_state.progress_value,
+                completed=st.session_state.completed_companies,
+                total=st.session_state.total_companies,
+                started_at=started_at,
+                last_event=f"{company_name}: пробую загрузить страницу через requests.",
+            )
+
         text = fetch_text_requests(url)
 
         if len(text) >= 1000:
@@ -1233,60 +679,44 @@ def get_page_text(url: str, company_name: str) -> Dict[str, Any]:
         log(f"{company_name}: requests вернул слишком мало текста: {len(text)} символов")
 
     except Exception as exc:
-        result["error"] = repr(exc)
         log(f"{company_name}: requests ошибка: {repr(exc)}")
 
     try:
-        log(f"{company_name}: пробую Playwright deep scrape: {url}")
+        log(f"{company_name}: пробую Playwright: {url}")
+
+        if live_ui and started_at:
+            render_live_status(
+                ui=live_ui,
+                status=f"Анализ: {company_name}",
+                step="Парсинг страницы",
+                company=company_name,
+                progress=st.session_state.progress_value,
+                completed=st.session_state.completed_companies,
+                total=st.session_state.total_companies,
+                started_at=started_at,
+                last_event=f"{company_name}: requests не сработал, пробую Playwright.",
+            )
+
         text = fetch_text_playwright(url)
 
         if len(text) >= 300:
             result["text"] = text
-            result["method"] = "playwright_deep"
+            result["method"] = "playwright"
             result["status"] = "ОК"
-            log(f"{company_name}: Playwright deep scrape успешно, символов: {len(text)}")
+            log(f"{company_name}: Playwright успешно, символов: {len(text)}")
             return result
 
         result["text"] = text
-        result["method"] = "playwright_deep"
+        result["method"] = "playwright"
         result["status"] = "Мало текста"
         result["error"] = f"Получено мало текста: {len(text)} символов."
-        log(f"{company_name}: Playwright deep scrape вернул мало текста: {len(text)} символов")
+        log(f"{company_name}: Playwright вернул мало текста: {len(text)} символов")
         return result
 
     except Exception as exc:
-        previous_error = result.get("error", "")
-        result["error"] = f"requests error: {previous_error}; playwright error: {repr(exc)}"
-        log(f"{company_name}: Playwright deep scrape ошибка: {repr(exc)}")
+        result["error"] = traceback.format_exc()
+        log(f"{company_name}: Playwright ошибка: {repr(exc)}")
         return result
-
-
-def is_probable_blocking_error(error_text: str) -> bool:
-    if not error_text:
-        return False
-
-    lowered = error_text.lower()
-
-    blocking_markers = [
-        "401",
-        "403",
-        "unauthorized",
-        "forbidden",
-        "timeout",
-        "timed out",
-        "connecttimeout",
-        "readtimeout",
-        "captcha",
-        "access denied",
-        "blocked",
-        "too many requests",
-        "429",
-        "bot",
-        "antibot",
-        "cloudflare",
-    ]
-
-    return any(marker in lowered for marker in blocking_markers)
 
 
 # =========================
@@ -1333,22 +763,8 @@ def build_extraction_prompt(
     url: str,
     source_text: str,
     params: List[str],
-    source_mode: str = "parsed",
 ) -> str:
     params_json = json.dumps(params, ensure_ascii=False, indent=2)
-
-    if source_mode == "manual":
-        source_note = (
-            "Текст страницы был вставлен пользователем вручную, потому что сайт "
-            "не отдал данные автоматическому парсеру."
-        )
-    elif source_mode == "playwright_deep":
-        source_note = (
-            "Текст страницы был получен усиленным Playwright-парсером: "
-            "собран базовый текст, раскрыты аккордеоны, табы, кнопки и PDF-документы."
-        )
-    else:
-        source_note = "Текст страницы был получен автоматическим парсером."
 
     return f"""
 Ты аналитик, который заполняет battle card / сравнительную таблицу по данным с сайта.
@@ -1368,9 +784,6 @@ def build_extraction_prompt(
 URL источника:
 {url}
 
-Источник текста:
-{source_note}
-
 Параметры, которые нужно заполнить:
 {params_json}
 
@@ -1385,8 +798,6 @@ URL источника:
 8. Для параметра "Статус парсинга" укажи одну из формулировок:
    - "Данные извлечены"
    - "Данные частично извлечены"
-   - "Данные извлечены усиленным парсером"
-   - "Данные извлечены из текста, вставленного вручную"
    - "На странице мало релевантной информации"
 9. Не добавляй ключи, которых нет в списке параметров.
 
@@ -1449,62 +860,32 @@ def build_unification_prompt(
 """.strip()
 
 
-def extract_record_with_llm(
-    battle_card_name: str,
-    product_name: str,
-    company_name: str,
-    url: str,
-    source_text: str,
-    params: List[str],
-    source_mode: str,
-    parsing_status: str,
-) -> Dict[str, Any]:
-    trimmed_text = source_text[:MAX_SOURCE_CHARS]
-
-    prompt = build_extraction_prompt(
-        battle_card_name=battle_card_name,
-        product_name=product_name,
-        company_name=company_name,
-        url=url,
-        source_text=trimmed_text,
-        params=params,
-        source_mode=source_mode,
-    )
-
-    response_text = call_llm(prompt)
-    raw_record = extract_json_from_text(response_text)
-
-    normalized = normalize_record_to_schema(
-        raw_record=raw_record,
-        company_name=company_name,
-        url=url,
-        params=params,
-        parsing_status=parsing_status,
-    )
-
-    st.session_state.last_raw_records.append(raw_record)
-
-    return normalized
-
-
 def maybe_unify_records_with_llm(
     battle_card_name: str,
     product_name: str,
     params: List[str],
     records: List[Dict[str, Any]],
     use_unification: bool,
+    live_ui: Optional[Dict[str, Any]] = None,
+    started_at: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     if not use_unification:
         return records
 
     try:
-        update_runtime_ui(
-            status="Унификация общей таблицы",
-            step="LLM-унификация",
-            company="Все компании",
-            progress=95,
-            user_message="Запущена унификация общей таблицы.",
-        )
+        if live_ui and started_at:
+            render_live_status(
+                ui=live_ui,
+                status="Унификация общей таблицы",
+                step="Унификация общей таблицы",
+                company="Все компании",
+                progress=95,
+                completed=st.session_state.completed_companies,
+                total=st.session_state.total_companies,
+                started_at=started_at,
+                last_event="Запущена финальная унификация записей.",
+            )
+
         log("Запуск унификации общей таблицы через LLM.")
 
         prompt = build_unification_prompt(
@@ -1551,6 +932,20 @@ def maybe_unify_records_with_llm(
 
         if normalized_records:
             log("Унификация успешно завершена.")
+
+            if live_ui and started_at:
+                render_live_status(
+                    ui=live_ui,
+                    status="Унификация завершена",
+                    step="Формирование файла",
+                    company="Все компании",
+                    progress=98,
+                    completed=st.session_state.completed_companies,
+                    total=st.session_state.total_companies,
+                    started_at=started_at,
+                    last_event="Унификация успешно завершена.",
+                )
+
             return normalized_records
 
         log("Унификация вернула пустой список, оставляю исходные записи.")
@@ -1560,6 +955,20 @@ def maybe_unify_records_with_llm(
         log(f"Ошибка унификации: {repr(exc)}")
         log(traceback.format_exc())
         add_user_update("Унификация не выполнена из-за ошибки. Таблица сохранена в исходном извлечённом виде.")
+
+        if live_ui and started_at:
+            render_live_status(
+                ui=live_ui,
+                status="Унификация не выполнена",
+                step="Формирование файла",
+                company="Все компании",
+                progress=98,
+                completed=st.session_state.completed_companies,
+                total=st.session_state.total_companies,
+                started_at=started_at,
+                last_event="Унификация не выполнена из-за ошибки. Использую исходные записи.",
+            )
+
         return records
 
 
@@ -1567,218 +976,166 @@ def maybe_unify_records_with_llm(
 # PIPELINE
 # =========================
 
-def make_blocked_placeholder_record(
-    company_name: str,
-    url: str,
-    params: List[str],
-    error_text: str,
-) -> Dict[str, Any]:
-    if is_probable_blocking_error(error_text):
-        status = (
-            "Сайт заблокировал парсер или не отдал страницу автоматически. "
-            "Нужно вставить текст страницы вручную."
-        )
-    else:
-        status = (
-            "Не удалось получить страницу автоматически. "
-            "Можно вставить текст страницы вручную."
-        )
-
-    record = normalize_record_to_schema(
-        raw_record={},
-        company_name=company_name,
-        url=url,
-        params=params,
-        parsing_status=status,
-    )
-
-    if "Что не указано на странице" in record:
-        record["Что не указано на странице"] = (
-            "Автоматический парсер не получил текст страницы. "
-            "Для извлечения данных нужно открыть сайт вручную, скопировать текст и вставить его в приложение."
-        )
-
-    return record
-
-
-def add_pending_manual_request(
-    company_name: str,
-    url: str,
-    error_text: str,
-) -> None:
-    existing_keys = {
-        (item.get("name", ""), item.get("url", ""))
-        for item in st.session_state.pending_manual_requests
-    }
-
-    key = (company_name, url)
-
-    if key in existing_keys:
-        return
-
-    st.session_state.pending_manual_requests.append(
-        {
-            "name": company_name,
-            "url": url,
-            "error": error_text,
-            "manual_text": "",
-        }
-    )
-
-
 def run_pipeline(
     battle_card_name: str,
     product_name: str,
     selected_companies: List[Dict[str, str]],
     params: List[str],
     use_unification: bool,
+    live_ui: Optional[Dict[str, Any]] = None,
+    started_at: Optional[float] = None,
 ) -> pd.DataFrame:
     reset_runtime_state()
+
+    if started_at is None:
+        started_at = time.time()
 
     params = ensure_system_params(params)
     selected_companies = deduplicate_companies(selected_companies)
 
     if not selected_companies:
-        raise ValueError("Не указано ни одной компании со ссылкой или ручным текстом.")
+        raise ValueError("Не указано ни одной компании со ссылкой.")
 
     if not params:
         raise ValueError("Не указаны параметры сравнения.")
 
     st.session_state.total_companies = len(selected_companies)
-
-    st.session_state.pipeline_context = {
-        "battle_card_name": battle_card_name,
-        "product_name": product_name,
-        "params": params,
-        "use_unification": use_unification,
-    }
-
-    st.session_state.last_columns = ["Компания"] + params
-
     records = []
 
-    update_runtime_ui(
-        status="Запущен сбор данных",
-        step="Подготовка",
-        company="—",
-        progress=0,
-        user_message="Пайплайн запущен.",
-    )
+    log("Пайплайн запущен.")
+    log(f"Название баттл-карты: {battle_card_name}")
+    log(f"Что сравниваем: {product_name}")
+    log(f"Компаний: {len(selected_companies)}")
+    log(f"Параметров: {len(params)}")
+
+    if live_ui:
+        render_live_status(
+            ui=live_ui,
+            status="Запущен сбор данных",
+            step="Подготовка списка компаний и параметров",
+            company="—",
+            progress=0,
+            completed=0,
+            total=len(selected_companies),
+            started_at=started_at,
+            last_event="Список компаний и параметров подготовлен.",
+        )
 
     for index, company in enumerate(selected_companies):
         company_name = company["name"]
-        url = company.get("url", "")
-        manual_text = company.get("manual_text", "")
+        url = company["url"]
 
         base_progress = int((index / len(selected_companies)) * 90)
 
-        if manual_text:
-            update_runtime_ui(
+        if live_ui:
+            render_live_status(
+                ui=live_ui,
                 status=f"Анализ: {company_name}",
-                step="LLM-извлечение из ручного текста",
+                step="Парсинг страницы",
                 company=company_name,
                 progress=base_progress,
-                user_message=f"Использую текст, вставленный вручную: {company_name}.",
+                completed=st.session_state.completed_companies,
+                total=st.session_state.total_companies,
+                started_at=started_at,
+                last_event=f"Начинаю парсинг страницы: {url}",
             )
 
-            try:
-                normalized = extract_record_with_llm(
-                    battle_card_name=battle_card_name,
-                    product_name=product_name,
-                    company_name=company_name,
-                    url=url,
-                    source_text=manual_text,
-                    params=params,
-                    source_mode="manual",
-                    parsing_status="Данные извлечены из текста, вставленного вручную",
-                )
-                records.append(normalized)
-                log(f"{company_name}: LLM-извлечение из ручного текста успешно.")
-
-            except Exception as exc:
-                log(f"{company_name}: ошибка LLM-извлечения из ручного текста: {repr(exc)}")
-                log(traceback.format_exc())
-
-                normalized = normalize_record_to_schema(
-                    raw_record={},
-                    company_name=company_name,
-                    url=url,
-                    params=params,
-                    parsing_status=f"Ошибка LLM-извлечения из ручного текста: {repr(exc)[:300]}",
-                )
-                records.append(normalized)
-
-            st.session_state.completed_companies += 1
-            continue
-
-        update_runtime_ui(
-            status=f"Анализ: {company_name}",
-            step="Парсинг страницы",
-            company=company_name,
-            progress=base_progress,
-            user_message=f"Парсю страницу: {company_name}.",
+        page_result = get_page_text(
+            url=url,
+            company_name=company_name,
+            live_ui=live_ui,
+            started_at=started_at,
         )
 
-        page_result = get_page_text(url, company_name)
         source_text = page_result.get("text", "")
         parser_status = page_result.get("status", "Ошибка парсинга")
         parser_error = page_result.get("error", "")
-        parser_method = page_result.get("method", "")
 
         if not source_text:
             log(f"{company_name}: текст страницы не получен.")
+            raw_record = {}
+            parsing_status = f"Ошибка парсинга: {parser_error[:300]}" if parser_error else "Ошибка парсинга"
 
-            add_pending_manual_request(
-                company_name=company_name,
-                url=url,
-                error_text=parser_error,
-            )
-
-            placeholder = make_blocked_placeholder_record(
+            normalized = normalize_record_to_schema(
+                raw_record=raw_record,
                 company_name=company_name,
                 url=url,
                 params=params,
-                error_text=parser_error,
+                parsing_status=parsing_status,
             )
-
-            records.append(placeholder)
-
-            add_user_update(
-                f"Сайт {company_name} не отдал страницу парсеру. "
-                f"Нужно вставить текст вручную в блоке ниже."
-            )
-
+            records.append(normalized)
             st.session_state.completed_companies += 1
+
+            if live_ui:
+                render_live_status(
+                    ui=live_ui,
+                    status=f"Ошибка парсинга: {company_name}",
+                    step="Компания обработана",
+                    company=company_name,
+                    progress=min(int(((index + 1) / len(selected_companies)) * 90), 90),
+                    completed=st.session_state.completed_companies,
+                    total=st.session_state.total_companies,
+                    started_at=started_at,
+                    last_event=f"{company_name}: текст страницы не получен, запись добавлена со статусом ошибки.",
+                )
+
             continue
 
-        update_runtime_ui(
-            status=f"Анализ: {company_name}",
-            step="LLM-извлечение",
-            company=company_name,
-            progress=min(base_progress + 10, 90),
-            user_message=f"Извлекаю параметры через LLM: {company_name}.",
-        )
+        if live_ui:
+            render_live_status(
+                ui=live_ui,
+                status=f"Анализ: {company_name}",
+                step="Извлечение параметров через LLM",
+                company=company_name,
+                progress=min(base_progress + 10, 90),
+                completed=st.session_state.completed_companies,
+                total=st.session_state.total_companies,
+                started_at=started_at,
+                last_event=f"{company_name}: текст страницы получен. Символов: {len(source_text)}. Запускаю LLM.",
+            )
 
         try:
-            parsing_status = "Данные извлечены"
+            trimmed_text = source_text[:MAX_SOURCE_CHARS]
 
-            if parser_method == "playwright_deep":
-                parsing_status = "Данные извлечены усиленным парсером"
-            elif parser_status != "ОК":
-                parsing_status = f"Данные частично извлечены; статус парсинга: {parser_status}"
-
-            normalized = extract_record_with_llm(
+            prompt = build_extraction_prompt(
                 battle_card_name=battle_card_name,
                 product_name=product_name,
                 company_name=company_name,
                 url=url,
-                source_text=source_text,
+                source_text=trimmed_text,
                 params=params,
-                source_mode=parser_method or "parsed",
+            )
+
+            response_text = call_llm(prompt)
+            raw_record = extract_json_from_text(response_text)
+
+            if live_ui:
+                render_live_status(
+                    ui=live_ui,
+                    status=f"Анализ: {company_name}",
+                    step="Нормализация записи",
+                    company=company_name,
+                    progress=min(base_progress + 20, 90),
+                    completed=st.session_state.completed_companies,
+                    total=st.session_state.total_companies,
+                    started_at=started_at,
+                    last_event=f"{company_name}: LLM вернула JSON, нормализую запись под заданную схему.",
+                )
+
+            parsing_status = "Данные извлечены"
+            if parser_status != "ОК":
+                parsing_status = f"Данные частично извлечены; статус парсинга: {parser_status}"
+
+            normalized = normalize_record_to_schema(
+                raw_record=raw_record,
+                company_name=company_name,
+                url=url,
+                params=params,
                 parsing_status=parsing_status,
             )
 
             records.append(normalized)
+            st.session_state.last_raw_records.append(raw_record)
 
             log(f"{company_name}: LLM-извлечение успешно.")
 
@@ -1797,170 +1154,67 @@ def run_pipeline(
 
             add_user_update(f"По компании {company_name} возникла ошибка извлечения. Запись добавлена со статусом ошибки.")
 
+            if live_ui:
+                render_live_status(
+                    ui=live_ui,
+                    status=f"Ошибка LLM-извлечения: {company_name}",
+                    step="Нормализация записи",
+                    company=company_name,
+                    progress=min(base_progress + 20, 90),
+                    completed=st.session_state.completed_companies,
+                    total=st.session_state.total_companies,
+                    started_at=started_at,
+                    last_event=f"{company_name}: ошибка LLM-извлечения, запись добавлена со статусом ошибки.",
+                )
+
         st.session_state.completed_companies += 1
 
-        update_runtime_ui(
-            status=f"Завершено: {company_name}",
-            step="Компания обработана",
-            company=company_name,
-            progress=min(int(((index + 1) / len(selected_companies)) * 90), 90),
-            user_message=f"Компания обработана: {company_name}.",
-        )
-
-    st.session_state.base_records = records
-
-    if st.session_state.pending_manual_requests:
-        final_records = records
-        update_runtime_ui(
-            status="Часть сайтов не отдала текст парсеру",
-            step="Ожидается ручная вставка текста",
-            company="Сайты с блокировкой",
-            progress=90,
-            user_message="Для части сайтов нужно вручную вставить текст страницы.",
-        )
-    else:
-        final_records = maybe_unify_records_with_llm(
-            battle_card_name=battle_card_name,
-            product_name=product_name,
-            params=params,
-            records=records,
-            use_unification=use_unification,
-        )
-
-        update_runtime_ui(
-            status="Готово",
-            step="Завершено",
-            company="Все компании",
-            progress=100,
-            user_message="Таблица сформирована.",
-        )
-
-    df = build_dataframe_from_records(final_records, params)
-    st.session_state.last_df = df
-
-    return df
-
-
-def replace_records_with_manual_results(
-    base_records: List[Dict[str, Any]],
-    manual_records: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    manual_by_company_url = {}
-
-    for record in manual_records:
-        company = str(record.get("Компания", "")).strip()
-        url = str(record.get("URL источника", "")).strip()
-        manual_by_company_url[(company, url)] = record
-
-    result = []
-
-    for record in base_records:
-        company = str(record.get("Компания", "")).strip()
-        url = str(record.get("URL источника", "")).strip()
-        key = (company, url)
-
-        if key in manual_by_company_url:
-            result.append(manual_by_company_url[key])
-        else:
-            result.append(record)
-
-    return result
-
-
-def process_manual_requests() -> Optional[pd.DataFrame]:
-    context = st.session_state.pipeline_context
-
-    if not context:
-        st.error("Нет контекста предыдущего запуска. Запустите сбор данных заново.")
-        return None
-
-    battle_card_name = context["battle_card_name"]
-    product_name = context["product_name"]
-    params = context["params"]
-    use_unification = context["use_unification"]
-
-    manual_records = []
-
-    update_runtime_ui(
-        status="Обработка вручную вставленного текста",
-        step="LLM-извлечение из ручного текста",
-        company="Сайты с блокировкой",
-        progress=90,
-        user_message="Начата обработка вручную вставленного текста.",
-    )
-
-    for item in st.session_state.pending_manual_requests:
-        company_name = item.get("name", "")
-        url = item.get("url", "")
-        manual_text = item.get("manual_text", "")
-
-        if not manual_text or len(manual_text.strip()) < 200:
-            add_user_update(
-                f"Для {company_name} текст не обработан: вставлено слишком мало текста."
-            )
-            continue
-
-        try:
-            update_runtime_ui(
-                status=f"Обработка ручного текста: {company_name}",
-                step="LLM-извлечение из ручного текста",
+        if live_ui:
+            render_live_status(
+                ui=live_ui,
+                status=f"Завершено: {company_name}",
+                step="Компания обработана",
                 company=company_name,
-                progress=92,
-                user_message=f"Передаю вручную вставленный текст в LLM: {company_name}.",
+                progress=min(int(((index + 1) / len(selected_companies)) * 90), 90),
+                completed=st.session_state.completed_companies,
+                total=st.session_state.total_companies,
+                started_at=started_at,
+                last_event=f"Компания обработана: {company_name}.",
             )
-
-            normalized = extract_record_with_llm(
-                battle_card_name=battle_card_name,
-                product_name=product_name,
-                company_name=company_name,
-                url=url,
-                source_text=manual_text,
-                params=params,
-                source_mode="manual",
-                parsing_status="Данные извлечены из текста, вставленного вручную",
-            )
-
-            manual_records.append(normalized)
-            log(f"{company_name}: ручной текст успешно обработан через LLM.")
-
-        except Exception as exc:
-            log(f"{company_name}: ошибка обработки ручного текста: {repr(exc)}")
-            log(traceback.format_exc())
-
-            error_record = normalize_record_to_schema(
-                raw_record={},
-                company_name=company_name,
-                url=url,
-                params=params,
-                parsing_status=f"Ошибка обработки ручного текста: {repr(exc)[:300]}",
-            )
-            manual_records.append(error_record)
-
-    st.session_state.manual_records = manual_records
-
-    merged_records = replace_records_with_manual_results(
-        base_records=st.session_state.base_records,
-        manual_records=manual_records,
-    )
 
     final_records = maybe_unify_records_with_llm(
         battle_card_name=battle_card_name,
         product_name=product_name,
         params=params,
-        records=merged_records,
+        records=records,
         use_unification=use_unification,
+        live_ui=live_ui,
+        started_at=started_at,
     )
 
-    df = build_dataframe_from_records(final_records, params)
+    columns = ["Компания"] + params
+    df = pd.DataFrame(final_records)
+
+    for column in columns:
+        if column not in df.columns:
+            df[column] = "Не указано"
+
+    df = df[columns]
+
     st.session_state.last_df = df
 
-    update_runtime_ui(
-        status="Готово",
-        step="Завершено после ручной вставки",
-        company="Все компании",
-        progress=100,
-        user_message="Таблица обновлена с учётом вручную вставленного текста.",
-    )
+    if live_ui:
+        render_live_status(
+            ui=live_ui,
+            status="Готово",
+            step="Завершено",
+            company="Все компании",
+            progress=100,
+            completed=st.session_state.completed_companies,
+            total=st.session_state.total_companies,
+            started_at=started_at,
+            last_event="Таблица сформирована.",
+        )
 
     return df
 
@@ -1970,7 +1224,7 @@ def process_manual_requests() -> Optional[pd.DataFrame]:
 # =========================
 
 def add_company_row() -> None:
-    st.session_state.custom_companies.append({"name": "", "url": "", "manual_text": ""})
+    st.session_state.custom_companies.append({"name": "", "url": ""})
 
 
 def remove_empty_company_rows() -> None:
@@ -1979,19 +1233,12 @@ def remove_empty_company_rows() -> None:
     for item in st.session_state.custom_companies:
         name = str(item.get("name", "")).strip()
         url = str(item.get("url", "")).strip()
-        manual_text = str(item.get("manual_text", "")).strip()
 
-        if name or url or manual_text:
-            cleaned.append(
-                {
-                    "name": name,
-                    "url": url,
-                    "manual_text": manual_text,
-                }
-            )
+        if name or url:
+            cleaned.append({"name": name, "url": url})
 
     if not cleaned:
-        cleaned = [{"name": "", "url": "", "manual_text": ""}]
+        cleaned = [{"name": "", "url": ""}]
 
     st.session_state.custom_companies = cleaned
 
@@ -2012,8 +1259,6 @@ def render_custom_companies_editor() -> List[Dict[str, str]]:
     edited_companies = []
 
     for i, company in enumerate(st.session_state.custom_companies):
-        st.markdown(f"**Компания {i + 1}**")
-
         cols = st.columns([1, 3])
 
         with cols[0]:
@@ -2032,125 +1277,11 @@ def render_custom_companies_editor() -> List[Dict[str, str]]:
                 placeholder="https://...",
             )
 
-        with st.expander(
-            f"Ручной текст для {name or 'компании ' + str(i + 1)}",
-            expanded=False,
-        ):
-            st.caption(
-                "Это поле можно заполнить заранее, если сайт точно блокирует парсеры. "
-                "Тогда приложение не будет парсить URL, а сразу передаст этот текст в LLM."
-            )
-            manual_text = st.text_area(
-                "Текст страницы вручную",
-                value=company.get("manual_text", ""),
-                key=f"custom_company_manual_text_{i}",
-                height=180,
-                placeholder="Откройте сайт, скопируйте текст страницы и вставьте сюда.",
-            )
-
-        edited_companies.append(
-            {
-                "name": name.strip(),
-                "url": url.strip(),
-                "manual_text": manual_text.strip(),
-            }
-        )
+        edited_companies.append({"name": name.strip(), "url": url.strip()})
 
     st.session_state.custom_companies = edited_companies
 
     return deduplicate_companies(edited_companies)
-
-
-# =========================
-# UI: MANUAL FALLBACK BLOCK
-# =========================
-
-def render_manual_fallback_block() -> None:
-    pending = st.session_state.pending_manual_requests
-
-    if not pending:
-        return
-
-    st.divider()
-
-    st.error(
-        "Сайт заблокировал парсер. "
-        "Откройте сайт по ссылке, скопируйте текст и вставьте его сюда."
-    )
-
-    st.caption(
-        "После вставки текста нажмите кнопку обработки. "
-        "Приложение передаст этот текст в LLM вместо текста, который не удалось получить парсером."
-    )
-
-    updated_pending = []
-
-    for i, item in enumerate(pending):
-        company_name = item.get("name", "")
-        url = item.get("url", "")
-        error_text = item.get("error", "")
-
-        with st.container(border=True):
-            st.markdown(f"### {company_name}")
-
-            if url:
-                st.markdown(f"[Открыть сайт]({url})")
-
-            with st.expander("Техническая причина", expanded=False):
-                st.code(error_text or "Нет технической ошибки.")
-
-            manual_text = st.text_area(
-                "Откройте сайт по ссылке, скопируйте текст и вставьте сюда:",
-                value=item.get("manual_text", ""),
-                key=f"pending_manual_text_{i}_{company_name}",
-                height=260,
-                placeholder=(
-                    "Вставьте сюда текст страницы. "
-                    "Лучше копировать основной текст продукта: условия, тарифы, требования, ограничения, FAQ."
-                ),
-            )
-
-            updated_item = dict(item)
-            updated_item["manual_text"] = manual_text.strip()
-            updated_pending.append(updated_item)
-
-    st.session_state.pending_manual_requests = updated_pending
-
-    process_button = st.button(
-        "Обработать вставленный текст",
-        type="primary",
-        use_container_width=True,
-    )
-
-    if process_button:
-        df = process_manual_requests()
-
-        if df is not None:
-            st.success("Вручную вставленный текст обработан. Таблица обновлена.")
-            st.dataframe(df, use_container_width=True)
-
-            csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-            excel_bytes = dataframe_to_excel_bytes(df)
-
-            download_col1, download_col2 = st.columns(2)
-
-            with download_col1:
-                st.download_button(
-                    label="Скачать обновлённый CSV",
-                    data=csv_bytes,
-                    file_name="battle_card.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-
-            with download_col2:
-                st.download_button(
-                    label="Скачать обновлённый Excel",
-                    data=excel_bytes,
-                    file_name="battle_card.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
 
 
 # =========================
@@ -2164,6 +1295,11 @@ if client is None:
         "LLM-клиент не инициализирован: не заданы YANDEX_FOLDER и/или YANDEX_API_KEY. "
         "Без этих переменных приложение сможет открыть интерфейс, но не сможет извлекать данные через LLM."
     )
+
+st.caption(
+    "Парсинг одной страницы может занимать от нескольких секунд до минуты. "
+    "Если сайт защищён от обычного запроса или долго отвечает, приложение сначала пробует requests, затем Playwright."
+)
 
 mode = st.radio(
     "Режим",
@@ -2199,17 +1335,14 @@ if mode == "Быстрый":
     )
 
     selected_companies = [
-        {
-            "name": company["name"],
-            "url": company["url"],
-            "manual_text": "",
-        }
+        company
         for company in available_companies
         if company["name"] in selected_names
     ]
 
     with st.expander("Параметры сравнения", expanded=False):
-        st.write(params)
+        for param in params:
+            st.write(f"• {param}")
 
 else:
     st.subheader("Расширенный режим: универсальный конструктор")
@@ -2254,7 +1387,10 @@ else:
 
 st.divider()
 
-render_runtime_panel()
+static_panel_placeholder = st.empty()
+
+with static_panel_placeholder.container():
+    render_static_runtime_panel()
 
 st.divider()
 
@@ -2274,6 +1410,11 @@ with col_info:
     )
 
 if run_button:
+    static_panel_placeholder.empty()
+
+    live_ui = init_live_ui()
+    started_at = time.time()
+
     try:
         df = run_pipeline(
             battle_card_name=battle_card_name,
@@ -2281,16 +1422,11 @@ if run_button:
             selected_companies=selected_companies,
             params=params,
             use_unification=use_unification,
+            live_ui=live_ui,
+            started_at=started_at,
         )
 
-        if st.session_state.pending_manual_requests:
-            st.warning(
-                "Таблица сформирована частично. "
-                "Для части сайтов нужно вручную вставить текст страницы."
-            )
-        else:
-            st.success("Готово. Таблица сформирована.")
-
+        st.success("Готово. Таблица сформирована.")
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
@@ -2321,10 +1457,21 @@ if run_button:
         log(f"Критическая ошибка запуска: {repr(exc)}")
         log(traceback.format_exc())
 
+        if "live_ui" in locals():
+            render_live_status(
+                ui=live_ui,
+                status="Ошибка",
+                step="Завершено",
+                company=st.session_state.current_company,
+                progress=st.session_state.progress_value,
+                completed=st.session_state.completed_companies,
+                total=st.session_state.total_companies,
+                started_at=started_at,
+                last_event=f"Критическая ошибка: {repr(exc)}",
+            )
+
         with st.expander("Подробности ошибки", expanded=True):
             st.code(traceback.format_exc())
-
-render_manual_fallback_block()
 
 if st.session_state.last_df is not None and not run_button:
     st.subheader("Последний результат")
@@ -2350,4 +1497,5 @@ if st.session_state.last_df is not None and not run_button:
             data=excel_bytes,
             file_name="battle_card.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
         )
