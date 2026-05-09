@@ -1448,17 +1448,20 @@ def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str 
     prefix = f"{log_prefix}: " if log_prefix else ""
 
     selectors = [
-        "button",
-        "a",
-        "[role='button']",
         "summary",
-        "[aria-expanded='false']",
+        "[aria-expanded='false'][aria-controls]",
+        "[aria-controls][role='button']",
+        "[aria-controls][role='tab']",
+        "[role='tab']",
         "[data-bs-toggle='collapse']",
         "[data-bs-toggle='tab']",
         "[data-toggle='collapse']",
         "[data-toggle='tab']",
+        "a[href^='#'][data-bs-toggle]",
+        "a[href^='#'][data-toggle]",
+        "a[href^='#'][role='tab']",
         ".accordion-button",
-        ".accordion-header",
+        ".accordion-header button",
         ".faq__question",
         "[data-testid*='accordion']",
         "[data-testid*='collapse']",
@@ -1475,18 +1478,16 @@ def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str 
         "[data-qa*='accordion']",
         "[data-qa*='collapse']",
         "[data-qa*='tab']",
-        "[class*='accordion']",
-        "[class*='Accordion']",
-        "[class*='faq']",
-        "[class*='Faq']",
-        "[class*='spoiler']",
-        "[class*='Spoiler']",
-        "[class*='collapse']",
-        "[class*='Collapse']",
-        "[class*='tab']",
-        "[class*='Tab']",
-        "[class*='dropdown']",
-        "[class*='Dropdown']",
+        "[class*='accordion'] button",
+        "[class*='Accordion'] button",
+        "[class*='faq'] button",
+        "[class*='Faq'] button",
+        "[class*='spoiler'] button",
+        "[class*='Spoiler'] button",
+        "[class*='collapse'] button",
+        "[class*='Collapse'] button",
+        "[class*='tabs'] button",
+        "[class*='Tabs'] button",
     ]
 
     log(f"{prefix}поиск раскрываемых элементов: старт, селекторов: {len(selectors)}, лимит кликов: {max_clicks}")
@@ -1494,7 +1495,7 @@ def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str 
     for selector in selectors:
         try:
             elements = page.locator(selector)
-            count = min(elements.count(), 350)
+            count = min(elements.count(), 120)
             if count:
                 log(f"{prefix}селектор раскрытия '{selector}': найдено элементов: {count}")
 
@@ -1689,10 +1690,10 @@ def fetch_text_playwright(url: str, company_name: str = "") -> str:
             log(f"{log_prefix}: domcontentloaded получен.")
 
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("networkidle", timeout=5000)
                 log(f"{log_prefix}: networkidle получен.")
             except Exception as exc:
-                log(f"{log_prefix}: networkidle не дождались за 15 секунд: {repr(exc)}")
+                log(f"{log_prefix}: networkidle не дождались за 5 секунд: {repr(exc)}")
                 pass
 
             page.wait_for_timeout(2000)
@@ -1708,33 +1709,33 @@ def fetch_text_playwright(url: str, company_name: str = "") -> str:
             expanded_bootstrap_count_1 = force_expand_bootstrap_blocks(page)
             log(f"{log_prefix}: Bootstrap/collapse блоков раскрыто через DOM, раунд 1: {expanded_bootstrap_count_1}")
 
-            scroll_page_deeply(page, max_rounds=8, log_prefix=f"{log_prefix}: первичный проход")
+            scroll_page_deeply(page, max_rounds=5, log_prefix=f"{log_prefix}: первичный проход")
             initial_text = collect_visible_body_text(page)
             log(f"{log_prefix}: текст после первичного прохода: {len(initial_text)} символов.")
 
             clicked_labels_round_1 = click_safe_expandable_elements(
                 page,
-                max_clicks=90,
+                max_clicks=45,
                 log_prefix=f"{log_prefix}: раскрытие раунд 1",
             )
             log(f"{log_prefix}: кликов раскрытия в раунде 1: {len(clicked_labels_round_1)}")
             expanded_bootstrap_count_2 = force_expand_bootstrap_blocks(page)
             log(f"{log_prefix}: Bootstrap/collapse блоков раскрыто через DOM, раунд 2: {expanded_bootstrap_count_2}")
 
-            scroll_page_deeply(page, max_rounds=6, log_prefix=f"{log_prefix}: второй проход")
+            scroll_page_deeply(page, max_rounds=3, log_prefix=f"{log_prefix}: второй проход")
             clicked_labels_round_2 = click_safe_expandable_elements(
                 page,
-                max_clicks=70,
+                max_clicks=30,
                 log_prefix=f"{log_prefix}: раскрытие раунд 2",
             )
             log(f"{log_prefix}: кликов раскрытия в раунде 2: {len(clicked_labels_round_2)}")
             expanded_bootstrap_count_3 = force_expand_bootstrap_blocks(page)
             log(f"{log_prefix}: Bootstrap/collapse блоков раскрыто через DOM, раунд 3: {expanded_bootstrap_count_3}")
 
-            scroll_page_deeply(page, max_rounds=4, log_prefix=f"{log_prefix}: третий проход")
+            scroll_page_deeply(page, max_rounds=2, log_prefix=f"{log_prefix}: третий проход")
             clicked_labels_round_3 = click_safe_expandable_elements(
                 page,
-                max_clicks=50,
+                max_clicks=20,
                 log_prefix=f"{log_prefix}: раскрытие раунд 3",
             )
             log(f"{log_prefix}: кликов раскрытия в раунде 3: {len(clicked_labels_round_3)}")
