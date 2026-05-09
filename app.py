@@ -811,13 +811,9 @@ def normalize_link(href: str, base_url: str) -> str:
 
 def is_relevant_document_link(href: str, text: str = "") -> bool:
     href_l = (href or "").lower()
-    text_l = (text or "").lower()
-    combined = href_l + " " + text_l
-
     has_file_ext = any(ext in href_l for ext in FILE_EXTENSIONS)
-    has_keyword = any(word in combined for word in RELEVANT_DOC_KEYWORDS)
 
-    return has_file_ext or has_keyword
+    return has_file_ext
 
 
 def download_binary(url: str, timeout: int = 35) -> bytes:
@@ -1308,9 +1304,147 @@ def is_safe_expand_text(text: str) -> bool:
     return any(pattern in t for pattern in safe_patterns)
 
 
+def strip_url_fragment(url: str) -> str:
+    return str(url or "").split("#", 1)[0]
+
+
+def get_element_navigation_metadata(element) -> Dict[str, str]:
+    try:
+        metadata = element.evaluate("""
+        el => ({
+            tag: (el.tagName || '').toLowerCase(),
+            href: el.getAttribute('href') || '',
+            target: el.getAttribute('target') || '',
+            role: el.getAttribute('role') || '',
+            ariaControls: el.getAttribute('aria-controls') || '',
+            ariaExpanded: el.getAttribute('aria-expanded') || '',
+            dataBsToggle: el.getAttribute('data-bs-toggle') || '',
+            dataToggle: el.getAttribute('data-toggle') || '',
+            dataQaType: el.getAttribute('data-qa-type') || '',
+            dataQa: el.getAttribute('data-qa') || '',
+            className: String(el.className || '')
+        })
+        """)
+
+        return {
+            str(key): str(value or "")
+            for key, value in metadata.items()
+        }
+    except Exception:
+        return {}
+
+
+def is_same_page_toggle_candidate(metadata: Dict[str, str], current_url: str) -> bool:
+    tag = metadata.get("tag", "").lower()
+    href = metadata.get("href", "").strip()
+    href_l = href.lower()
+    combined = " ".join(
+        [
+            metadata.get("role", ""),
+            metadata.get("ariaControls", ""),
+            metadata.get("ariaExpanded", ""),
+            metadata.get("dataBsToggle", ""),
+            metadata.get("dataToggle", ""),
+            metadata.get("dataQaType", ""),
+            metadata.get("dataQa", ""),
+            metadata.get("className", ""),
+        ]
+    ).lower()
+
+    toggle_markers = [
+        "accordion",
+        "collapse",
+        "tab",
+        "tabs",
+        "spoiler",
+        "faq",
+        "dropdown",
+    ]
+
+    if tag == "summary":
+        return True
+
+    has_toggle_marker = any(marker in combined for marker in toggle_markers)
+    has_aria_toggle = bool(metadata.get("ariaControls") or metadata.get("ariaExpanded"))
+    has_button_role = metadata.get("role", "").lower() in {"button", "tab"}
+
+    if tag == "a":
+        if metadata.get("target", "").lower() == "_blank":
+            return False
+
+        if not href or href_l in {"#", "javascript:void(0)", "javascript:void(0);"}:
+            return has_toggle_marker or has_aria_toggle or has_button_role or href_l.startswith("javascript")
+
+        if href_l.startswith("javascript:"):
+            return has_toggle_marker or has_aria_toggle or has_button_role
+
+        normalized_href = normalize_link(href, current_url)
+        if href.startswith("#") or (
+            "#" in normalized_href
+            and strip_url_fragment(normalized_href) == strip_url_fragment(current_url)
+        ):
+            return True
+
+        return False
+
+    return has_toggle_marker or has_aria_toggle or has_button_role or tag == "button"
+
+
+def close_extra_pages_after_click(page, before_pages_count: int, log_prefix: str = "") -> None:
+    prefix = f"{log_prefix}: " if log_prefix else ""
+
+    try:
+        pages = page.context.pages
+        if len(pages) <= before_pages_count:
+            return
+
+        extra_pages = pages[before_pages_count:]
+        log(f"{prefix}клик открыл новых вкладок/страниц: {len(extra_pages)}; закрываю их.")
+        for extra_page in extra_pages:
+            try:
+                extra_page.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def recover_current_page_after_navigation(page, before_url: str, log_prefix: str = "") -> bool:
+    prefix = f"{log_prefix}: " if log_prefix else ""
+
+    try:
+        after_url = page.url
+    except Exception:
+        return False
+
+    if strip_url_fragment(after_url) == strip_url_fragment(before_url):
+        return False
+
+    log(
+        f"{prefix}клик вызвал переход вне текущей страницы; "
+        f"возвращаюсь назад. Было: {before_url}; стало: {after_url}"
+    )
+
+    try:
+        page.go_back(wait_until="domcontentloaded", timeout=8000)
+        page.wait_for_timeout(800)
+        return True
+    except Exception as exc:
+        log(f"{prefix}go_back не сработал после нежелательного перехода: {repr(exc)}")
+
+    try:
+        page.goto(before_url, wait_until="domcontentloaded", timeout=12000)
+        page.wait_for_timeout(800)
+        return True
+    except Exception as exc:
+        log(f"{prefix}не удалось восстановить исходную страницу: {repr(exc)}")
+        return True
+
+
 def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str = "") -> List[str]:
     clicked_labels = []
     clicked_fingerprints = set()
+    skipped_navigation_count = 0
     prefix = f"{log_prefix}: " if log_prefix else ""
 
     selectors = [
@@ -1386,6 +1520,20 @@ def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str 
                     if not is_safe_expand_text(combined_label):
                         continue
 
+                    metadata = get_element_navigation_metadata(element)
+                    current_url = page.url
+
+                    if not is_same_page_toggle_candidate(metadata, current_url):
+                        skipped_navigation_count += 1
+                        if skipped_navigation_count <= 30 or skipped_navigation_count % 50 == 0:
+                            href = metadata.get("href", "")
+                            log(
+                                f"{prefix}пропущен элемент с риском перехода: "
+                                f"{shorten_log_text(combined_label)}"
+                                f"{' | href=' + shorten_log_text(href, 120) if href else ''}"
+                            )
+                        continue
+
                     fingerprint = f"{selector}|{i}|{combined_label.lower()[:160]}"
                     if fingerprint in clicked_fingerprints:
                         continue
@@ -1398,6 +1546,13 @@ def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str 
                     except Exception:
                         pass
 
+                    before_url = page.url
+                    before_pages_count = 0
+                    try:
+                        before_pages_count = len(page.context.pages)
+                    except Exception:
+                        pass
+
                     try:
                         element.click(timeout=2500, force=False)
                     except Exception:
@@ -1405,6 +1560,21 @@ def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str 
                             element.click(timeout=2500, force=True)
                         except Exception:
                             continue
+
+                    page.wait_for_timeout(250)
+                    close_extra_pages_after_click(
+                        page,
+                        before_pages_count=before_pages_count,
+                        log_prefix=log_prefix,
+                    )
+                    navigated_away = recover_current_page_after_navigation(
+                        page,
+                        before_url=before_url,
+                        log_prefix=log_prefix,
+                    )
+
+                    if navigated_away:
+                        continue
 
                     clicked_labels.append(combined_label[:220])
                     if len(clicked_labels) <= 25 or len(clicked_labels) % 10 == 0:
@@ -1420,12 +1590,17 @@ def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str 
         except Exception:
             continue
 
-    log(f"{prefix}поиск раскрываемых элементов завершён; кликов выполнено: {len(clicked_labels)}")
+    log(
+        f"{prefix}поиск раскрываемых элементов завершён; "
+        f"кликов выполнено: {len(clicked_labels)}, "
+        f"пропущено из-за риска перехода: {skipped_navigation_count}"
+    )
     return clicked_labels
 
 
 def extract_document_links(page, base_url: str) -> List[str]:
     links = []
+    skipped_keyword_only_links = 0
 
     try:
         anchors = page.locator("a")
@@ -1447,6 +1622,9 @@ def extract_document_links(page, base_url: str) -> List[str]:
                     continue
 
                 if not is_relevant_document_link(href, text):
+                    combined = f"{href} {text}".lower()
+                    if any(word in combined for word in RELEVANT_DOC_KEYWORDS):
+                        skipped_keyword_only_links += 1
                     continue
 
                 label = clean_text(text)
@@ -1460,6 +1638,12 @@ def extract_document_links(page, base_url: str) -> List[str]:
 
     except Exception:
         pass
+
+    if skipped_keyword_only_links:
+        log(
+            "Документы: пропущено ссылок на HTML-страницы без прямого файла "
+            f"(чтобы не уходить с текущей страницы): {skipped_keyword_only_links}"
+        )
 
     return links
 
