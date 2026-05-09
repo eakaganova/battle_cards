@@ -7,13 +7,16 @@ import re
 import time
 import traceback
 from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
 
+import docx
 import openai
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from pypdf import PdfReader
 
 
 # =========================
@@ -126,9 +129,13 @@ YANDEX_MODEL = os.getenv("YANDEX_MODEL", "gpt-oss-120b/latest")
 
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 
-MAX_SOURCE_CHARS = 35000
-REQUESTS_TIMEOUT = 20
-PLAYWRIGHT_TIMEOUT = 60000
+MAX_SOURCE_CHARS = 60000
+REQUESTS_TIMEOUT = 25
+PLAYWRIGHT_TIMEOUT = 70000
+
+MAX_DOCUMENT_FILES = 8
+MAX_PDF_PAGES = 80
+MAX_DOCUMENT_CHARS = 30000
 
 
 # =========================
@@ -279,6 +286,8 @@ def render_live_status(
         "Подготовка списка компаний и параметров",
         "Парсинг страницы",
         "Раскрытие скрытых блоков",
+        "Сбор документов",
+        "Обработка документов",
         "Использование ручного текста",
         "Извлечение параметров через LLM",
         "Нормализация записи",
@@ -305,7 +314,7 @@ def render_live_status(
 
     with ui["log_box"].expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-100:]:
+            for item in st.session_state.logs[-120:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -335,7 +344,7 @@ def render_static_runtime_panel() -> None:
 
     with st.expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-100:]:
+            for item in st.session_state.logs[-120:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -448,7 +457,6 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
         raise ValueError("LLM вернула пустой ответ.")
 
     cleaned = text.strip()
-
     cleaned = cleaned.replace("```json", "```")
     cleaned = cleaned.replace("```JSON", "```")
 
@@ -486,9 +494,7 @@ def normalize_record_to_schema(
     params: List[str],
     parsing_status: str,
 ) -> Dict[str, Any]:
-    record = {
-        "Компания": company_name,
-    }
+    record = {"Компания": company_name}
 
     lower_key_map = {
         str(key).strip().lower(): key
@@ -527,7 +533,6 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Battle Card")
-
         worksheet = writer.sheets["Battle Card"]
 
         for column_cells in worksheet.columns:
@@ -549,6 +554,173 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 
     output.seek(0)
     return output.getvalue()
+
+
+# =========================
+# DOCUMENT HELPERS
+# =========================
+
+FILE_EXTENSIONS = [".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv"]
+
+RELEVANT_DOC_KEYWORDS = [
+    "услов", "тариф", "правил", "документ", "памят", "договор",
+    "пск", "полная стоимость", "страхован", "требован", "анкета",
+    "залог", "кредит", "ипотек", "раскрытие", "регламент",
+    "комис", "ставк", "заемщик", "заёмщик", "оферт", "положение"
+]
+
+
+def normalize_link(href: str, base_url: str) -> str:
+    if not href:
+        return ""
+
+    href = href.strip()
+
+    if href.startswith("//"):
+        return "https:" + href
+
+    return urljoin(base_url, href)
+
+
+def is_relevant_document_link(href: str, text: str = "") -> bool:
+    href_l = (href or "").lower()
+    text_l = (text or "").lower()
+    combined = href_l + " " + text_l
+
+    has_file_ext = any(ext in href_l for ext in FILE_EXTENSIONS)
+    has_keyword = any(word in combined for word in RELEVANT_DOC_KEYWORDS)
+
+    return has_file_ext or has_keyword
+
+
+def download_binary(url: str, timeout: int = 35) -> bytes:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    }
+
+    response = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    response.raise_for_status()
+    return response.content
+
+
+def extract_text_from_pdf_bytes(content: bytes) -> str:
+    output = []
+
+    reader = PdfReader(io.BytesIO(content))
+
+    for i, page in enumerate(reader.pages[:MAX_PDF_PAGES], start=1):
+        try:
+            text = page.extract_text() or ""
+            text = clean_text(text)
+            if text:
+                output.append(f"\n--- PDF, страница {i} ---\n{text}")
+        except Exception:
+            continue
+
+    return clean_text("\n".join(output))
+
+
+def extract_text_from_docx_bytes(content: bytes) -> str:
+    document = docx.Document(io.BytesIO(content))
+    parts = []
+
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if text:
+            parts.append(text)
+
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            cells = [cell for cell in cells if cell]
+            if cells:
+                parts.append(" | ".join(cells))
+
+    return clean_text("\n".join(parts))
+
+
+def extract_text_from_xlsx_bytes(content: bytes) -> str:
+    xls = pd.ExcelFile(io.BytesIO(content))
+    parts = []
+
+    for sheet in xls.sheet_names[:10]:
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
+            df = df.fillna("")
+            text = df.to_csv(index=False, sep=";")
+            parts.append(f"\n--- XLSX/XLS, лист: {sheet} ---\n{text}")
+        except Exception:
+            continue
+
+    return clean_text("\n".join(parts))
+
+
+def extract_text_from_downloaded_file(url: str, content: bytes) -> str:
+    url_l = url.lower()
+
+    if ".pdf" in url_l:
+        return extract_text_from_pdf_bytes(content)
+
+    if ".docx" in url_l:
+        return extract_text_from_docx_bytes(content)
+
+    if ".xlsx" in url_l or ".xls" in url_l:
+        return extract_text_from_xlsx_bytes(content)
+
+    if ".csv" in url_l:
+        return clean_text(content.decode("utf-8", errors="ignore"))
+
+    return ""
+
+
+def fetch_relevant_documents_texts(document_links: List[str], max_files: int = MAX_DOCUMENT_FILES) -> str:
+    parts = []
+    processed = 0
+
+    for item in document_links:
+        if processed >= max_files:
+            break
+
+        if ": http" in item:
+            label, url = item.rsplit(": ", 1)
+        else:
+            label, url = "", item
+
+        try:
+            log(f"Скачиваю документ: {url}")
+            content = download_binary(url)
+            text = extract_text_from_downloaded_file(url, content)
+
+            if text and len(text) >= 100:
+                processed += 1
+                parts.append(
+                    f"\n=== ТЕКСТ ИЗ ДОКУМЕНТА ===\n"
+                    f"Название ссылки: {label or 'Не указано'}\n"
+                    f"URL документа: {url}\n\n"
+                    f"{text[:MAX_DOCUMENT_CHARS]}"
+                )
+                log(f"Документ обработан: {url}, символов: {len(text)}")
+            else:
+                parts.append(
+                    f"\n=== ДОКУМЕНТ НАЙДЕН, НО ТЕКСТ НЕ ИЗВЛЕЧЁН ===\n"
+                    f"Название ссылки: {label or 'Не указано'}\n"
+                    f"URL документа: {url}"
+                )
+                log(f"Документ найден, но текст не извлечён: {url}")
+
+        except Exception as exc:
+            log(f"Ошибка скачивания/чтения документа {url}: {repr(exc)}")
+            parts.append(
+                f"\n=== ДОКУМЕНТ НАЙДЕН, НО НЕ ОБРАБОТАН ===\n"
+                f"URL документа: {url}\n"
+                f"Ошибка: {repr(exc)}"
+            )
+
+    return clean_text("\n".join(parts))
 
 
 # =========================
@@ -598,7 +770,7 @@ def is_safe_expand_text(text: str) -> bool:
     t = text.strip().lower()
     t = re.sub(r"\s+", " ", t)
 
-    if len(t) > 220:
+    if len(t) > 260:
         return False
 
     safe_patterns = [
@@ -642,6 +814,23 @@ def is_safe_expand_text(text: str) -> bool:
         "памятка",
         "правила",
         "о продукте",
+        "полная стоимость кредита",
+        "пск",
+        "график",
+        "ставки",
+        "диапазон ставок",
+        "надбавки",
+        "скидки к ставке",
+        "требования к залогу",
+        "требования к объекту",
+        "требования к заемщику",
+        "требования к заёмщику",
+        "список документов",
+        "необходимые документы",
+        "подробные тарифы",
+        "условия кредитования",
+        "общие условия",
+        "индивидуальные условия",
     ]
 
     unsafe_patterns = [
@@ -697,7 +886,6 @@ def click_cookie_banners(page) -> int:
         "[aria-label='Close']",
         "[aria-label='Закрыть']",
         "[data-testid='close']",
-        
     ]
 
     for selector in selectors:
@@ -763,7 +951,7 @@ def get_element_label(element) -> str:
     except Exception:
         pass
 
-    for attr in ["aria-label", "title", "data-testid", "class"]:
+    for attr in ["aria-label", "title", "data-testid", "data-qa", "data-qa-type", "class"]:
         try:
             value = element.get_attribute(attr)
             if value:
@@ -773,10 +961,10 @@ def get_element_label(element) -> str:
 
     label = " ".join(parts)
     label = clean_text(label)
-    return label[:220]
+    return label[:260]
 
 
-def click_safe_expandable_elements(page, max_clicks: int = 100) -> List[str]:
+def click_safe_expandable_elements(page, max_clicks: int = 130) -> List[str]:
     clicked_labels = []
     clicked_fingerprints = set()
 
@@ -787,11 +975,20 @@ def click_safe_expandable_elements(page, max_clicks: int = 100) -> List[str]:
         "summary",
         "[aria-expanded='false']",
         "[data-testid*='accordion']",
+        "[data-testid*='collapse']",
+        "[data-testid*='faq']",
+        "[data-testid*='tab']",
         "[data-qa-type='uikit/accordion.item']",
         "[data-qa-type*='accordion']",
         "[data-qa-type*='Accordion']",
         "[data-qa-type*='collapse']",
+        "[data-qa-type*='Collapse']",
         "[data-qa-type*='spoiler']",
+        "[data-qa-type*='tab']",
+        "[data-qa-type*='Tab']",
+        "[data-qa*='accordion']",
+        "[data-qa*='collapse']",
+        "[data-qa*='tab']",
         "[class*='accordion']",
         "[class*='Accordion']",
         "[class*='faq']",
@@ -802,12 +999,14 @@ def click_safe_expandable_elements(page, max_clicks: int = 100) -> List[str]:
         "[class*='Collapse']",
         "[class*='tab']",
         "[class*='Tab']",
+        "[class*='dropdown']",
+        "[class*='Dropdown']",
     ]
-    
+
     for selector in selectors:
         try:
             elements = page.locator(selector)
-            count = min(elements.count(), 250)
+            count = min(elements.count(), 300)
 
             for i in range(count):
                 if len(clicked_labels) >= max_clicks:
@@ -850,7 +1049,7 @@ def click_safe_expandable_elements(page, max_clicks: int = 100) -> List[str]:
                         except Exception:
                             continue
 
-                    clicked_labels.append(combined_label[:180])
+                    clicked_labels.append(combined_label[:220])
                     page.wait_for_timeout(700)
 
                 except Exception:
@@ -867,64 +1066,31 @@ def extract_document_links(page, base_url: str) -> List[str]:
 
     try:
         anchors = page.locator("a")
-        count = min(anchors.count(), 800)
-
-        origin = ""
-        origin_match = re.match(r"^(https?://[^/]+)", base_url)
-        if origin_match:
-            origin = origin_match.group(1)
+        count = min(anchors.count(), 1500)
 
         for i in range(count):
             try:
                 anchor = anchors.nth(i)
                 href = anchor.get_attribute("href") or ""
 
-                text = ""
                 try:
                     text = anchor.inner_text(timeout=500)
                 except Exception:
-                    pass
+                    text = ""
 
-                href_l = href.lower()
-                text_l = text.lower()
+                href = normalize_link(href, base_url)
 
-                is_relevant = (
-                    ".pdf" in href_l
-                    or ".doc" in href_l
-                    or ".docx" in href_l
-                    or ".xls" in href_l
-                    or ".xlsx" in href_l
-                    or "document" in href_l
-                    or "docs" in href_l
-                    or "upload" in href_l
-                    or "file" in href_l
-                    or "files" in href_l
-                    or "услов" in text_l
-                    or "тариф" in text_l
-                    or "правил" in text_l
-                    or "документ" in text_l
-                    or "памят" in text_l
-                    or "pdf" in text_l
-                    or "договор" in text_l
-                    or "полис" in text_l
-                    or "заявление" in text_l
-                    or "регламент" in text_l
-                )
-
-                if not is_relevant:
+                if not href.startswith("http"):
                     continue
 
-                if href.startswith("//"):
-                    href = "https:" + href
-                elif href.startswith("/") and origin:
-                    href = origin + href
+                if not is_relevant_document_link(href, text):
+                    continue
 
-                if href.startswith("http") and href not in links:
-                    label = clean_text(text)
-                    if label:
-                        links.append(f"{label}: {href}")
-                    else:
-                        links.append(href)
+                label = clean_text(text)
+                item = f"{label}: {href}" if label else href
+
+                if item not in links:
+                    links.append(item)
 
             except Exception:
                 continue
@@ -957,6 +1123,7 @@ def fetch_text_playwright(url: str) -> str:
                 locale="ru-RU",
                 viewport={"width": 1440, "height": 1600},
                 java_script_enabled=True,
+                accept_downloads=True,
             )
 
             page = context.new_page()
@@ -979,19 +1146,24 @@ def fetch_text_playwright(url: str) -> str:
             scroll_page_deeply(page, max_rounds=8)
             initial_text = collect_visible_body_text(page)
 
-            clicked_labels_round_1 = click_safe_expandable_elements(page, max_clicks=70)
+            clicked_labels_round_1 = click_safe_expandable_elements(page, max_clicks=80)
 
             scroll_page_deeply(page, max_rounds=6)
-            clicked_labels_round_2 = click_safe_expandable_elements(page, max_clicks=50)
+            clicked_labels_round_2 = click_safe_expandable_elements(page, max_clicks=60)
 
             scroll_page_deeply(page, max_rounds=4)
-            clicked_labels_round_3 = click_safe_expandable_elements(page, max_clicks=30)
+            clicked_labels_round_3 = click_safe_expandable_elements(page, max_clicks=40)
 
             final_text = collect_visible_body_text(page)
             document_links = extract_document_links(page, url)
 
             context.close()
             browser.close()
+
+            documents_text = fetch_relevant_documents_texts(
+                document_links=document_links,
+                max_files=MAX_DOCUMENT_FILES,
+            )
 
             clicked_labels = clicked_labels_round_1 + clicked_labels_round_2 + clicked_labels_round_3
 
@@ -1021,6 +1193,10 @@ def fetch_text_playwright(url: str) -> str:
                 for link in document_links:
                     parts.append(link)
 
+            if documents_text:
+                parts.append("\n=== ИЗВЛЕЧЁННЫЙ ТЕКСТ ИЗ ДОКУМЕНТОВ / ТАРИФОВ / УСЛОВИЙ ===")
+                parts.append(documents_text)
+
             combined_text = "\n".join(parts)
             return clean_text(combined_text)
 
@@ -1031,7 +1207,7 @@ def fetch_text_playwright(url: str) -> str:
             raise RuntimeError(
                 "Playwright установлен, но браузер Chromium не скачан. "
                 "В Render нужно добавить Environment Variable: PLAYWRIGHT_BROWSERS_PATH=0, "
-                "а в build.sh команду: PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium. "
+                "а в build command добавить: python -m playwright install chromium. "
                 "После этого выполнить Manual Deploy → Clear build cache & deploy."
             ) from exc
 
@@ -1094,20 +1270,20 @@ def get_page_text(
                 completed=st.session_state.completed_companies,
                 total=st.session_state.total_companies,
                 started_at=started_at,
-                last_event=f"{company_name}: requests не сработал или дал мало текста. Пробую Playwright с раскрытием блоков.",
+                last_event=f"{company_name}: пробую Playwright, раскрытие блоков и сбор документов.",
             )
 
         text = fetch_text_playwright(url)
 
         if len(text) >= 300:
             result["text"] = text
-            result["method"] = "playwright_deep"
+            result["method"] = "playwright_deep_with_documents"
             result["status"] = "ОК"
             log(f"{company_name}: Playwright успешно, символов: {len(text)}")
             return result
 
         result["text"] = text
-        result["method"] = "playwright_deep"
+        result["method"] = "playwright_deep_with_documents"
         result["status"] = "Мало текста"
         result["error"] = f"Получено мало текста: {len(text)} символов."
         log(f"{company_name}: Playwright вернул мало текста: {len(text)} символов")
@@ -1167,7 +1343,7 @@ def build_extraction_prompt(
     params_json = json.dumps(params, ensure_ascii=False, indent=2)
 
     return f"""
-Ты аналитик, который заполняет battle card / сравнительную таблицу по данным с сайта или из ручного текста пользователя.
+Ты аналитик, который заполняет battle card / сравнительную таблицу по данным с сайта, скрытых блоков, документов или ручного текста пользователя.
 
 Задача:
 Нужно извлечь информацию о продукте / сервисе / предложении компании и заполнить значения строго по заданным параметрам.
@@ -1190,15 +1366,16 @@ URL источника:
 Правила:
 1. Верни только валидный JSON-объект. Никакого Markdown, пояснений и текста вокруг JSON.
 2. Ключи JSON должны точно совпадать с названиями параметров из списка.
-3. Используй весь предоставленный текст, включая разделы:
+3. Используй весь предоставленный текст, включая:
    - метаданные парсинга;
    - текст до раскрытия блоков;
    - раскрытые элементы;
    - текст после раскрытия блоков;
    - найденные ссылки на документы / условия;
+   - извлечённый текст из PDF/DOCX/XLSX/CSV;
    - ручной текст пользователя, если он был использован.
-4. Если текст получен вручную от пользователя, обрабатывай его так же, как текст страницы. Не добавляй факты вне предоставленного текста.
-5. Если на странице есть ссылка на документ, PDF, правила, тарифы или подробные условия, но сам текст документа не был извлечён, укажи это в релевантных параметрах.
+4. Если есть извлечённый текст из документа, считай его полноценным источником.
+5. Если есть только ссылка на документ, но текст документа не был извлечён, укажи это в релевантных параметрах.
 6. Если на странице или в ручном тексте нет данных по параметру, укажи "Не указано".
 7. Не выдумывай значения.
 8. Если значение найдено, формулируй кратко, но так, чтобы смысл был понятен.
@@ -1256,7 +1433,7 @@ def build_unification_prompt(
 7. Не выдумывай отсутствующие данные.
 8. Если данных нет, оставь "Не указано".
 9. Сохрани URL источника или значение "Нет URL / использован ручной текст".
-10. Унифицируй только стиль и формат записи: например, суммы, сроки, краткость описаний.
+10. Унифицируй только стиль и формат записи: суммы, сроки, краткость описаний.
 
 Верни JSON строго такого вида:
 {{
@@ -1687,11 +1864,7 @@ def run_pipeline(
 
 def add_company_row() -> None:
     st.session_state.custom_companies.append(
-        {
-            "name": "",
-            "url": "",
-            "manual_text": "",
-        }
+        {"name": "", "url": "", "manual_text": ""}
     )
 
 
@@ -1797,9 +1970,8 @@ if client is None:
     )
 
 st.caption(
-    "Парсинг одной страницы может занимать от нескольких секунд до минуты. "
-    "Если сайт защищён от обычного запроса или долго отвечает, приложение сначала пробует requests, "
-    "затем Playwright: скроллит страницу, раскрывает безопасные аккордеоны/FAQ/табы и собирает ссылки на документы. "
+    "Приложение сначала пробует requests, затем Playwright: скроллит страницу, раскрывает безопасные "
+    "аккордеоны/FAQ/табы, собирает ссылки на документы и пытается извлечь текст из PDF/DOCX/XLSX/CSV. "
     "Если сайт не спарсился, в расширенном режиме можно вставить текст вручную."
 )
 
