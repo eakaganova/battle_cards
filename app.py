@@ -217,6 +217,13 @@ def log(message: str) -> None:
     st.session_state.logs.append(f"[{timestamp}] {message}")
 
 
+def shorten_log_text(text: Any, limit: int = 220) -> str:
+    text = clean_text(str(text or ""))
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
 def add_user_update(message: str) -> None:
     timestamp = time.strftime("%H:%M:%S")
     st.session_state.user_updates.append(f"[{timestamp}] {message}")
@@ -347,7 +354,8 @@ def render_live_status(
 
     with ui["log_box"].expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-150:]:
+            st.caption(f"Показаны последние {min(len(st.session_state.logs), 400)} из {len(st.session_state.logs)} записей.")
+            for item in st.session_state.logs[-400:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -377,7 +385,8 @@ def render_static_runtime_panel() -> None:
 
     with st.expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-150:]:
+            st.caption(f"Показаны последние {min(len(st.session_state.logs), 400)} из {len(st.session_state.logs)} записей.")
+            for item in st.session_state.logs[-400:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -898,9 +907,13 @@ def extract_text_from_downloaded_file(url: str, content: bytes) -> str:
 def fetch_relevant_documents_texts(document_links: List[str], max_files: int = MAX_DOCUMENT_FILES) -> str:
     parts = []
     processed = 0
+    total_links = len(document_links)
 
-    for item in document_links:
+    log(f"Документы: найдено релевантных ссылок: {total_links}; лимит обработки файлов: {max_files}")
+
+    for index, item in enumerate(document_links, start=1):
         if processed >= max_files:
+            log(f"Документы: достигнут лимит {max_files}, остальные ссылки пропущены.")
             break
 
         if ": http" in item:
@@ -909,9 +922,13 @@ def fetch_relevant_documents_texts(document_links: List[str], max_files: int = M
             label, url = "", item
 
         try:
-            log(f"Скачиваю документ: {url}")
+            log(f"Документы: [{index}/{total_links}] скачиваю: {url}")
+            if label:
+                log(f"Документы: подпись ссылки: {shorten_log_text(label)}")
             content = download_binary(url)
+            log(f"Документы: [{index}/{total_links}] скачано байт: {len(content)}")
             text = extract_text_from_downloaded_file(url, content)
+            log(f"Документы: [{index}/{total_links}] извлечено символов текста: {len(text)}")
 
             if text and len(text) >= 100:
                 processed += 1
@@ -921,14 +938,14 @@ def fetch_relevant_documents_texts(document_links: List[str], max_files: int = M
                     f"URL документа: {url}\n\n"
                     f"{text[:MAX_DOCUMENT_CHARS]}"
                 )
-                log(f"Документ обработан: {url}, символов: {len(text)}")
+                log(f"Документы: обработан файл {processed}/{max_files}: {url}")
             else:
                 parts.append(
                     f"\n=== ДОКУМЕНТ НАЙДЕН, НО ТЕКСТ НЕ ИЗВЛЕЧЁН ===\n"
                     f"Название ссылки: {label or 'Не указано'}\n"
                     f"URL документа: {url}"
                 )
-                log(f"Документ найден, но текст не извлечён: {url}")
+                log(f"Документы: текст не извлечён или слишком короткий: {url}")
 
         except Exception as exc:
             log(f"Ошибка скачивания/чтения документа {url}: {repr(exc)}")
@@ -938,6 +955,7 @@ def fetch_relevant_documents_texts(document_links: List[str], max_files: int = M
                 f"Ошибка: {repr(exc)}"
             )
 
+    log(f"Документы: итогово успешно обработано файлов: {processed}; блоков в выдаче: {len(parts)}")
     return clean_text("\n".join(parts))
 
 
@@ -946,6 +964,7 @@ def fetch_relevant_documents_texts(document_links: List[str], max_files: int = M
 # =========================
 
 def fetch_text_requests(url: str) -> str:
+    log(f"requests: старт загрузки HTML: {url}")
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -964,15 +983,23 @@ def fetch_text_requests(url: str) -> str:
         allow_redirects=True,
     )
 
+    log(
+        "requests: ответ получен: "
+        f"status={response.status_code}, final_url={response.url}, bytes={len(response.content)}"
+    )
     response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "html.parser")
 
+    removed_tags = 0
     for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
         tag.decompose()
+        removed_tags += 1
 
     text = soup.get_text("\n")
-    return clean_text(text)
+    cleaned_text = clean_text(text)
+    log(f"requests: HTML очищен; удалено служебных тегов: {removed_tags}; символов текста: {len(cleaned_text)}")
+    return cleaned_text
 
 
 def force_expand_bootstrap_blocks(page) -> int:
@@ -1148,28 +1175,39 @@ def click_cookie_banners(page) -> int:
     return clicked
 
 
-def scroll_page_deeply(page, max_rounds: int = 8) -> None:
+def scroll_page_deeply(page, max_rounds: int = 8, log_prefix: str = "") -> None:
     last_height = 0
+    prefix = f"{log_prefix}: " if log_prefix else ""
 
-    for _ in range(max_rounds):
+    log(f"{prefix}скроллинг страницы: старт, максимум раундов: {max_rounds}")
+
+    for round_index in range(1, max_rounds + 1):
         try:
             current_height = page.evaluate("document.body.scrollHeight")
             page.mouse.wheel(0, 2500)
             page.wait_for_timeout(800)
 
             new_height = page.evaluate("document.body.scrollHeight")
+            log(
+                f"{prefix}скроллинг раунд {round_index}/{max_rounds}: "
+                f"высота до={current_height}, после={new_height}"
+            )
 
             if new_height == last_height and current_height == last_height:
+                log(f"{prefix}скроллинг остановлен: высота страницы больше не меняется.")
                 break
 
             last_height = new_height
-        except Exception:
+        except Exception as exc:
+            log(f"{prefix}скроллинг остановлен из-за ошибки: {repr(exc)}")
             break
 
     try:
         page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(500)
+        log(f"{prefix}скроллинг завершён, страница возвращена наверх.")
     except Exception:
+        log(f"{prefix}не удалось вернуть страницу наверх после скроллинга.")
         pass
 
 
@@ -1270,9 +1308,10 @@ def is_safe_expand_text(text: str) -> bool:
     return any(pattern in t for pattern in safe_patterns)
 
 
-def click_safe_expandable_elements(page, max_clicks: int = 150) -> List[str]:
+def click_safe_expandable_elements(page, max_clicks: int = 150, log_prefix: str = "") -> List[str]:
     clicked_labels = []
     clicked_fingerprints = set()
+    prefix = f"{log_prefix}: " if log_prefix else ""
 
     selectors = [
         "button",
@@ -1316,13 +1355,18 @@ def click_safe_expandable_elements(page, max_clicks: int = 150) -> List[str]:
         "[class*='Dropdown']",
     ]
 
+    log(f"{prefix}поиск раскрываемых элементов: старт, селекторов: {len(selectors)}, лимит кликов: {max_clicks}")
+
     for selector in selectors:
         try:
             elements = page.locator(selector)
             count = min(elements.count(), 350)
+            if count:
+                log(f"{prefix}селектор раскрытия '{selector}': найдено элементов: {count}")
 
             for i in range(count):
                 if len(clicked_labels) >= max_clicks:
+                    log(f"{prefix}достигнут лимит кликов раскрытия: {max_clicks}")
                     return clicked_labels
 
                 try:
@@ -1363,6 +1407,11 @@ def click_safe_expandable_elements(page, max_clicks: int = 150) -> List[str]:
                             continue
 
                     clicked_labels.append(combined_label[:220])
+                    if len(clicked_labels) <= 25 or len(clicked_labels) % 10 == 0:
+                        log(
+                            f"{prefix}раскрыт элемент #{len(clicked_labels)} "
+                            f"через '{selector}': {shorten_log_text(combined_label)}"
+                        )
                     page.wait_for_timeout(450)
 
                 except Exception:
@@ -1371,6 +1420,7 @@ def click_safe_expandable_elements(page, max_clicks: int = 150) -> List[str]:
         except Exception:
             continue
 
+    log(f"{prefix}поиск раскрываемых элементов завершён; кликов выполнено: {len(clicked_labels)}")
     return clicked_labels
 
 
@@ -1414,9 +1464,12 @@ def extract_document_links(page, base_url: str) -> List[str]:
     return links
 
 
-def fetch_text_playwright(url: str) -> str:
+def fetch_text_playwright(url: str, company_name: str = "") -> str:
+    log_prefix = company_name or "Playwright"
+
     try:
         with sync_playwright() as p:
+            log(f"{log_prefix}: Playwright стартовал, запускаю Chromium.")
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -1426,6 +1479,7 @@ def fetch_text_playwright(url: str) -> str:
                     "--disable-setuid-sandbox",
                 ],
             )
+            log(f"{log_prefix}: Chromium запущен в headless-режиме.")
 
             context = browser.new_context(
                 user_agent=(
@@ -1438,51 +1492,90 @@ def fetch_text_playwright(url: str) -> str:
                 java_script_enabled=True,
                 accept_downloads=True,
             )
+            log(f"{log_prefix}: создан browser context: locale=ru-RU, viewport=1440x1800.")
 
             page = context.new_page()
+            log(f"{log_prefix}: открываю страницу: {url}")
 
             page.goto(
                 url,
                 wait_until="domcontentloaded",
                 timeout=PLAYWRIGHT_TIMEOUT,
             )
+            log(f"{log_prefix}: domcontentloaded получен.")
 
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
+                log(f"{log_prefix}: networkidle получен.")
+            except Exception as exc:
+                log(f"{log_prefix}: networkidle не дождались за 15 секунд: {repr(exc)}")
                 pass
 
             page.wait_for_timeout(2000)
+            try:
+                log(f"{log_prefix}: текущий URL после редиректов: {page.url}")
+                log(f"{log_prefix}: title страницы: {shorten_log_text(page.title(), 180)}")
+            except Exception as exc:
+                log(f"{log_prefix}: не удалось прочитать URL/title: {repr(exc)}")
 
             cookies_clicked = click_cookie_banners(page)
+            log(f"{log_prefix}: cookie/pop-up кнопок закрыто: {cookies_clicked}")
 
             expanded_bootstrap_count_1 = force_expand_bootstrap_blocks(page)
-            log(f"Bootstrap/collapse блоков раскрыто через DOM, раунд 1: {expanded_bootstrap_count_1}")
+            log(f"{log_prefix}: Bootstrap/collapse блоков раскрыто через DOM, раунд 1: {expanded_bootstrap_count_1}")
 
-            scroll_page_deeply(page, max_rounds=8)
+            scroll_page_deeply(page, max_rounds=8, log_prefix=f"{log_prefix}: первичный проход")
             initial_text = collect_visible_body_text(page)
+            log(f"{log_prefix}: текст после первичного прохода: {len(initial_text)} символов.")
 
-            clicked_labels_round_1 = click_safe_expandable_elements(page, max_clicks=90)
+            clicked_labels_round_1 = click_safe_expandable_elements(
+                page,
+                max_clicks=90,
+                log_prefix=f"{log_prefix}: раскрытие раунд 1",
+            )
+            log(f"{log_prefix}: кликов раскрытия в раунде 1: {len(clicked_labels_round_1)}")
             expanded_bootstrap_count_2 = force_expand_bootstrap_blocks(page)
+            log(f"{log_prefix}: Bootstrap/collapse блоков раскрыто через DOM, раунд 2: {expanded_bootstrap_count_2}")
 
-            scroll_page_deeply(page, max_rounds=6)
-            clicked_labels_round_2 = click_safe_expandable_elements(page, max_clicks=70)
+            scroll_page_deeply(page, max_rounds=6, log_prefix=f"{log_prefix}: второй проход")
+            clicked_labels_round_2 = click_safe_expandable_elements(
+                page,
+                max_clicks=70,
+                log_prefix=f"{log_prefix}: раскрытие раунд 2",
+            )
+            log(f"{log_prefix}: кликов раскрытия в раунде 2: {len(clicked_labels_round_2)}")
             expanded_bootstrap_count_3 = force_expand_bootstrap_blocks(page)
+            log(f"{log_prefix}: Bootstrap/collapse блоков раскрыто через DOM, раунд 3: {expanded_bootstrap_count_3}")
 
-            scroll_page_deeply(page, max_rounds=4)
-            clicked_labels_round_3 = click_safe_expandable_elements(page, max_clicks=50)
+            scroll_page_deeply(page, max_rounds=4, log_prefix=f"{log_prefix}: третий проход")
+            clicked_labels_round_3 = click_safe_expandable_elements(
+                page,
+                max_clicks=50,
+                log_prefix=f"{log_prefix}: раскрытие раунд 3",
+            )
+            log(f"{log_prefix}: кликов раскрытия в раунде 3: {len(clicked_labels_round_3)}")
             expanded_bootstrap_count_4 = force_expand_bootstrap_blocks(page)
+            log(f"{log_prefix}: Bootstrap/collapse блоков раскрыто через DOM, раунд 4: {expanded_bootstrap_count_4}")
 
             final_text = collect_visible_body_text(page)
+            log(f"{log_prefix}: финальный текст страницы после раскрытий: {len(final_text)} символов.")
             document_links = extract_document_links(page, url)
+            log(f"{log_prefix}: найдено ссылок на документы / условия: {len(document_links)}")
+            for doc_index, doc_link in enumerate(document_links[:10], start=1):
+                log(f"{log_prefix}: документ #{doc_index}: {shorten_log_text(doc_link, 260)}")
+            if len(document_links) > 10:
+                log(f"{log_prefix}: ещё документов сверх первых 10: {len(document_links) - 10}")
 
             context.close()
             browser.close()
+            log(f"{log_prefix}: browser context и Chromium закрыты.")
 
+            log(f"{log_prefix}: начинаю обработку найденных документов.")
             documents_text = fetch_relevant_documents_texts(
                 document_links=document_links,
                 max_files=MAX_DOCUMENT_FILES,
             )
+            log(f"{log_prefix}: текст из документов: {len(documents_text)} символов.")
 
             clicked_labels = clicked_labels_round_1 + clicked_labels_round_2 + clicked_labels_round_3
             expanded_total = (
@@ -1523,9 +1616,16 @@ def fetch_text_playwright(url: str) -> str:
                 parts.append(documents_text)
 
             combined_text = "\n".join(parts)
-            return clean_text(combined_text)
+            cleaned_combined_text = clean_text(combined_text)
+            log(
+                f"{log_prefix}: итоговый deep source собран: "
+                f"{len(cleaned_combined_text)} символов, кликов={len(clicked_labels)}, "
+                f"DOM-раскрытий={expanded_total}, документов={len(document_links)}"
+            )
+            return cleaned_combined_text
 
     except Exception as exc:
+        log(f"{log_prefix}: критическая ошибка Playwright-парсинга: {repr(exc)}")
         error_text = str(exc)
 
         if "Executable doesn't exist" in error_text or "playwright install" in error_text:
@@ -1580,7 +1680,7 @@ def get_page_text(
                 last_event=f"{company_name}: запускаю deep parsing: страница, аккордеоны, табы, скрытые блоки, документы.",
             )
 
-        deep_text = fetch_text_playwright(url)
+        deep_text = fetch_text_playwright(url, company_name=company_name)
 
         parts = []
         parts.append("=== DEEP PLAYWRIGHT SOURCE ===")
