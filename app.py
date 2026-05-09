@@ -284,7 +284,7 @@ def render_live_status(
 
     steps = [
         "Подготовка списка компаний и параметров",
-        "Парсинг страницы",
+        "Расширенный парсинг страницы",
         "Раскрытие скрытых блоков",
         "Сбор документов",
         "Обработка документов",
@@ -314,7 +314,7 @@ def render_live_status(
 
     with ui["log_box"].expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-120:]:
+            for item in st.session_state.logs[-150:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -344,7 +344,7 @@ def render_static_runtime_panel() -> None:
 
     with st.expander("Технические логи", expanded=False):
         if st.session_state.logs:
-            for item in st.session_state.logs[-120:]:
+            for item in st.session_state.logs[-150:]:
                 st.code(item)
         else:
             st.write("Пока нет логов.")
@@ -358,6 +358,7 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
 
+    text = str(text)
     text = text.replace("\xa0", " ")
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
@@ -566,7 +567,8 @@ RELEVANT_DOC_KEYWORDS = [
     "услов", "тариф", "правил", "документ", "памят", "договор",
     "пск", "полная стоимость", "страхован", "требован", "анкета",
     "залог", "кредит", "ипотек", "раскрытие", "регламент",
-    "комис", "ставк", "заемщик", "заёмщик", "оферт", "положение"
+    "комис", "ставк", "заемщик", "заёмщик", "оферт", "положение",
+    "каско", "осаго", "страховая сумма", "франшиза", "gap"
 ]
 
 
@@ -724,7 +726,7 @@ def fetch_relevant_documents_texts(document_links: List[str], max_files: int = M
 
 
 # =========================
-# PARSERS: REQUESTS
+# PARSERS
 # =========================
 
 def fetch_text_requests(url: str) -> str:
@@ -754,119 +756,141 @@ def fetch_text_requests(url: str) -> str:
         tag.decompose()
 
     text = soup.get_text("\n")
-    text = clean_text(text)
-
-    return text
+    return clean_text(text)
 
 
-# =========================
-# PARSERS: PLAYWRIGHT DEEP MODE
-# =========================
+def force_expand_bootstrap_blocks(page) -> int:
+    try:
+        return page.evaluate("""
+        () => {
+            let count = 0;
 
-def is_safe_expand_text(text: str) -> bool:
-    if not text:
-        return False
+            document.querySelectorAll('.accordion-collapse, .collapse, .tab-pane').forEach(el => {
+                el.classList.add('show');
+                el.classList.add('active');
+                el.style.display = 'block';
+                el.style.visibility = 'visible';
+                el.style.height = 'auto';
+                el.style.maxHeight = 'none';
+                el.style.opacity = '1';
+                el.removeAttribute('hidden');
+                count += 1;
+            });
 
-    t = text.strip().lower()
-    t = re.sub(r"\s+", " ", t)
+            document.querySelectorAll('[aria-expanded="false"]').forEach(el => {
+                el.setAttribute('aria-expanded', 'true');
+            });
 
-    if len(t) > 260:
-        return False
+            document.querySelectorAll('[hidden]').forEach(el => {
+                el.removeAttribute('hidden');
+                el.style.display = 'block';
+                el.style.visibility = 'visible';
+            });
 
-    safe_patterns = [
-        "показать еще",
-        "показать ещё",
-        "показать все",
-        "показать полностью",
-        "раскрыть",
-        "развернуть",
-        "подробнее",
-        "читать далее",
-        "ещё",
-        "еще",
-        "все условия",
-        "условия",
-        "тарифы",
-        "документы",
-        "требования",
-        "вопросы",
-        "ответы",
-        "faq",
-        "частые вопросы",
-        "как оформить",
-        "что входит",
-        "что покрывает",
-        "исключения",
-        "ограничения",
-        "преимущества",
-        "подробные условия",
-        "полные условия",
-        "описание",
-        "детали",
-        "смотреть все",
-        "смотреть ещё",
-        "смотреть еще",
-        "раздел",
-        "состав",
-        "покрытие",
-        "страховые случаи",
-        "не страховые случаи",
-        "памятка",
-        "правила",
-        "о продукте",
-        "полная стоимость кредита",
-        "пск",
-        "график",
-        "ставки",
-        "диапазон ставок",
-        "надбавки",
-        "скидки к ставке",
-        "требования к залогу",
-        "требования к объекту",
-        "требования к заемщику",
-        "требования к заёмщику",
-        "список документов",
-        "необходимые документы",
-        "подробные тарифы",
-        "условия кредитования",
-        "общие условия",
-        "индивидуальные условия",
-    ]
+            return count;
+        }
+        """)
+    except Exception:
+        return 0
 
-    unsafe_patterns = [
-        "оформить",
-        "купить",
-        "оплатить",
-        "заказать",
-        "оставить заявку",
-        "подать заявку",
-        "получить",
-        "войти",
-        "вход",
-        "личный кабинет",
-        "зарегистрироваться",
-        "продолжить",
-        "перейти к оплате",
-        "рассчитать",
-        "рассчитать стоимость",
-        "отправить",
-        "позвонить",
-        "консультация",
-        "оставьте телефон",
-        "оставить телефон",
-        "заполнить",
-        "выбрать",
-        "перейти",
-        "скачать приложение",
-        "открыть счет",
-        "открыть счёт",
-        "получить карту",
-    ]
 
-    if any(pattern in t for pattern in unsafe_patterns):
-        return False
+def collect_bootstrap_accordion_text(page) -> str:
+    try:
+        items = page.evaluate("""
+        () => {
+            const result = [];
 
-    return any(pattern in t for pattern in safe_patterns)
+            document.querySelectorAll('.accordion-item, .faq__question').forEach((item, index) => {
+                const questionEl =
+                    item.querySelector('.accordion-button') ||
+                    item.querySelector('.accordion-header') ||
+                    item.querySelector('button') ||
+                    item.querySelector('[role="button"]');
+
+                const answerEl =
+                    item.querySelector('.accordion-body') ||
+                    item.querySelector('.inner-text') ||
+                    item.querySelector('.accordion-collapse') ||
+                    item.querySelector('.collapse');
+
+                const question = questionEl ? questionEl.textContent.trim() : '';
+                const answer = answerEl ? answerEl.textContent.trim() : '';
+
+                if (question || answer) {
+                    result.push({
+                        index: index + 1,
+                        question,
+                        answer
+                    });
+                }
+            });
+
+            return result;
+        }
+        """)
+
+        parts = []
+
+        for item in items:
+            question = clean_text(item.get("question", ""))
+            answer = clean_text(item.get("answer", ""))
+
+            if question or answer:
+                parts.append(f"Вопрос: {question}\nОтвет: {answer}")
+
+        return clean_text("\n\n".join(parts))
+
+    except Exception:
+        return ""
+
+
+def collect_hidden_dom_text(page) -> str:
+    try:
+        return page.evaluate("""
+        () => {
+            const parts = [];
+
+            document.querySelectorAll(
+                '.collapse, .accordion-body, .accordion-collapse, .tab-pane, [hidden], .faq__question, .inner-text'
+            ).forEach(el => {
+                const txt = el.textContent;
+                if (txt && txt.trim().length > 50) {
+                    parts.push(txt.trim());
+                }
+            });
+
+            return parts.join('\\n\\n');
+        }
+        """)
+    except Exception:
+        return ""
+
+
+def collect_visible_body_text(page) -> str:
+    texts = []
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=15000)
+        if body_text:
+            texts.append(body_text)
+    except Exception:
+        pass
+
+    try:
+        accordion_text = collect_bootstrap_accordion_text(page)
+        if accordion_text:
+            texts.append("\n=== ТЕКСТ ИЗ BOOTSTRAP-АККОРДЕОНОВ / FAQ ===\n" + accordion_text)
+    except Exception:
+        pass
+
+    try:
+        hidden_text = collect_hidden_dom_text(page)
+        if hidden_text:
+            texts.append("\n=== ТЕКСТ ИЗ СКРЫТЫХ DOM-БЛОКОВ ===\n" + hidden_text)
+    except Exception:
+        pass
+
+    return clean_text("\n\n".join(texts))
 
 
 def click_cookie_banners(page) -> int:
@@ -915,7 +939,7 @@ def scroll_page_deeply(page, max_rounds: int = 8) -> None:
         try:
             current_height = page.evaluate("document.body.scrollHeight")
             page.mouse.wheel(0, 2500)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(800)
 
             new_height = page.evaluate("document.body.scrollHeight")
 
@@ -928,17 +952,9 @@ def scroll_page_deeply(page, max_rounds: int = 8) -> None:
 
     try:
         page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(500)
     except Exception:
         pass
-
-
-def collect_visible_body_text(page) -> str:
-    try:
-        text = page.locator("body").inner_text(timeout=15000)
-        return clean_text(text)
-    except Exception:
-        return ""
 
 
 def get_element_label(element) -> str:
@@ -964,7 +980,81 @@ def get_element_label(element) -> str:
     return label[:260]
 
 
-def click_safe_expandable_elements(page, max_clicks: int = 130) -> List[str]:
+def is_safe_expand_text(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.strip().lower()
+    t = re.sub(r"\s+", " ", t)
+
+    if len(t) > 280:
+        return False
+
+    unsafe_patterns = [
+        "оформить",
+        "купить",
+        "оплатить",
+        "заказать",
+        "оставить заявку",
+        "подать заявку",
+        "получить карту",
+        "получить кредит",
+        "войти",
+        "личный кабинет",
+        "зарегистрироваться",
+        "продолжить",
+        "перейти к оплате",
+        "отправить",
+        "позвонить",
+        "оставьте телефон",
+        "оставить телефон",
+        "заполнить",
+        "скачать приложение",
+        "открыть счет",
+        "открыть счёт",
+    ]
+
+    if any(pattern in t for pattern in unsafe_patterns):
+        return False
+
+    safe_patterns = [
+        "показать",
+        "раскрыть",
+        "развернуть",
+        "подробнее",
+        "читать далее",
+        "ещё",
+        "еще",
+        "услов",
+        "тариф",
+        "документ",
+        "требован",
+        "вопрос",
+        "ответ",
+        "faq",
+        "как оформить",
+        "что входит",
+        "исключения",
+        "ограничения",
+        "преимущества",
+        "детали",
+        "смотреть",
+        "раздел",
+        "правила",
+        "о продукте",
+        "пск",
+        "ставки",
+        "комис",
+        "страх",
+        "франшиза",
+        "gap",
+        "тотал",
+    ]
+
+    return any(pattern in t for pattern in safe_patterns)
+
+
+def click_safe_expandable_elements(page, max_clicks: int = 150) -> List[str]:
     clicked_labels = []
     clicked_fingerprints = set()
 
@@ -974,6 +1064,13 @@ def click_safe_expandable_elements(page, max_clicks: int = 130) -> List[str]:
         "[role='button']",
         "summary",
         "[aria-expanded='false']",
+        "[data-bs-toggle='collapse']",
+        "[data-bs-toggle='tab']",
+        "[data-toggle='collapse']",
+        "[data-toggle='tab']",
+        ".accordion-button",
+        ".accordion-header",
+        ".faq__question",
         "[data-testid*='accordion']",
         "[data-testid*='collapse']",
         "[data-testid*='faq']",
@@ -1006,7 +1103,7 @@ def click_safe_expandable_elements(page, max_clicks: int = 130) -> List[str]:
     for selector in selectors:
         try:
             elements = page.locator(selector)
-            count = min(elements.count(), 300)
+            count = min(elements.count(), 350)
 
             for i in range(count):
                 if len(clicked_labels) >= max_clicks:
@@ -1037,20 +1134,20 @@ def click_safe_expandable_elements(page, max_clicks: int = 130) -> List[str]:
 
                     try:
                         element.scroll_into_view_if_needed(timeout=2000)
-                        page.wait_for_timeout(300)
+                        page.wait_for_timeout(250)
                     except Exception:
                         pass
 
                     try:
-                        element.click(timeout=3000, force=False)
+                        element.click(timeout=2500, force=False)
                     except Exception:
                         try:
-                            element.click(timeout=3000, force=True)
+                            element.click(timeout=2500, force=True)
                         except Exception:
                             continue
 
                     clicked_labels.append(combined_label[:220])
-                    page.wait_for_timeout(700)
+                    page.wait_for_timeout(450)
 
                 except Exception:
                     continue
@@ -1121,7 +1218,7 @@ def fetch_text_playwright(url: str) -> str:
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
                 locale="ru-RU",
-                viewport={"width": 1440, "height": 1600},
+                viewport={"width": 1440, "height": 1800},
                 java_script_enabled=True,
                 accept_downloads=True,
             )
@@ -1143,16 +1240,22 @@ def fetch_text_playwright(url: str) -> str:
 
             cookies_clicked = click_cookie_banners(page)
 
+            expanded_bootstrap_count_1 = force_expand_bootstrap_blocks(page)
+            log(f"Bootstrap/collapse блоков раскрыто через DOM, раунд 1: {expanded_bootstrap_count_1}")
+
             scroll_page_deeply(page, max_rounds=8)
             initial_text = collect_visible_body_text(page)
 
-            clicked_labels_round_1 = click_safe_expandable_elements(page, max_clicks=80)
+            clicked_labels_round_1 = click_safe_expandable_elements(page, max_clicks=90)
+            expanded_bootstrap_count_2 = force_expand_bootstrap_blocks(page)
 
             scroll_page_deeply(page, max_rounds=6)
-            clicked_labels_round_2 = click_safe_expandable_elements(page, max_clicks=60)
+            clicked_labels_round_2 = click_safe_expandable_elements(page, max_clicks=70)
+            expanded_bootstrap_count_3 = force_expand_bootstrap_blocks(page)
 
             scroll_page_deeply(page, max_rounds=4)
-            clicked_labels_round_3 = click_safe_expandable_elements(page, max_clicks=40)
+            clicked_labels_round_3 = click_safe_expandable_elements(page, max_clicks=50)
+            expanded_bootstrap_count_4 = force_expand_bootstrap_blocks(page)
 
             final_text = collect_visible_body_text(page)
             document_links = extract_document_links(page, url)
@@ -1166,21 +1269,27 @@ def fetch_text_playwright(url: str) -> str:
             )
 
             clicked_labels = clicked_labels_round_1 + clicked_labels_round_2 + clicked_labels_round_3
+            expanded_total = (
+                expanded_bootstrap_count_1
+                + expanded_bootstrap_count_2
+                + expanded_bootstrap_count_3
+                + expanded_bootstrap_count_4
+            )
 
             parts = []
-
             parts.append("=== МЕТАДАННЫЕ ПАРСИНГА ===")
             parts.append(f"URL: {url}")
             parts.append(f"Cookie/pop-up закрыто: {cookies_clicked}")
-            parts.append(f"Раскрытых элементов: {len(clicked_labels)}")
+            parts.append(f"Раскрытых элементов кликом: {len(clicked_labels)}")
+            parts.append(f"Bootstrap/collapse/tab блоков раскрыто через DOM: {expanded_total}")
             parts.append(f"Найденных ссылок на документы / условия: {len(document_links)}")
 
             if initial_text:
-                parts.append("\n=== ТЕКСТ ДО РАСКРЫТИЯ БЛОКОВ ===")
+                parts.append("\n=== ТЕКСТ ДО ДОПОЛНИТЕЛЬНЫХ КЛИКОВ ===")
                 parts.append(initial_text)
 
             if clicked_labels:
-                parts.append("\n=== РАСКРЫТЫЕ ЭЛЕМЕНТЫ ===")
+                parts.append("\n=== РАСКРЫТЫЕ ЭЛЕМЕНТЫ КЛИКОМ ===")
                 for label in clicked_labels:
                     parts.append(f"- {label}")
 
@@ -1227,71 +1336,70 @@ def get_page_text(
         "error": "",
     }
 
+    # ВАЖНО: расширенный парсинг запускается на любом сайте и в любом режиме.
+    # requests используется только как дополнительный быстрый источник,
+    # но итоговый source_text строится преимущественно через Playwright deep parser.
+    quick_text = ""
+
     try:
-        log(f"{company_name}: пробую requests: {url}")
-
-        if live_ui and started_at:
-            render_live_status(
-                ui=live_ui,
-                status=f"Анализ: {company_name}",
-                step="Парсинг страницы",
-                company=company_name,
-                progress=st.session_state.progress_value,
-                completed=st.session_state.completed_companies,
-                total=st.session_state.total_companies,
-                started_at=started_at,
-                last_event=f"{company_name}: пробую загрузить страницу через requests.",
-            )
-
-        text = fetch_text_requests(url)
-
-        if len(text) >= 1000:
-            result["text"] = text
-            result["method"] = "requests"
-            result["status"] = "ОК"
-            log(f"{company_name}: requests успешно, символов: {len(text)}")
-            return result
-
-        log(f"{company_name}: requests вернул слишком мало текста: {len(text)} символов")
-
+        log(f"{company_name}: пробую requests как дополнительный источник: {url}")
+        quick_text = fetch_text_requests(url)
+        log(f"{company_name}: requests получил символов: {len(quick_text)}")
     except Exception as exc:
         log(f"{company_name}: requests ошибка: {repr(exc)}")
 
     try:
-        log(f"{company_name}: пробую Playwright: {url}")
+        log(f"{company_name}: запускаю обязательный расширенный Playwright-парсинг: {url}")
 
         if live_ui and started_at:
             render_live_status(
                 ui=live_ui,
                 status=f"Анализ: {company_name}",
-                step="Раскрытие скрытых блоков",
+                step="Расширенный парсинг страницы",
                 company=company_name,
                 progress=st.session_state.progress_value,
                 completed=st.session_state.completed_companies,
                 total=st.session_state.total_companies,
                 started_at=started_at,
-                last_event=f"{company_name}: пробую Playwright, раскрытие блоков и сбор документов.",
+                last_event=f"{company_name}: запускаю deep parsing: страница, аккордеоны, табы, скрытые блоки, документы.",
             )
 
-        text = fetch_text_playwright(url)
+        deep_text = fetch_text_playwright(url)
 
-        if len(text) >= 300:
-            result["text"] = text
-            result["method"] = "playwright_deep_with_documents"
+        parts = []
+        parts.append("=== DEEP PLAYWRIGHT SOURCE ===")
+        parts.append(deep_text)
+
+        if quick_text and len(quick_text) >= 500:
+            parts.append("\n=== REQUESTS SOURCE, ДОПОЛНИТЕЛЬНО ===")
+            parts.append(quick_text)
+
+        combined_text = clean_text("\n\n".join(parts))
+
+        if len(combined_text) >= 300:
+            result["text"] = combined_text
+            result["method"] = "playwright_deep_required"
             result["status"] = "ОК"
-            log(f"{company_name}: Playwright успешно, символов: {len(text)}")
+            log(f"{company_name}: обязательный расширенный парсинг успешно, символов: {len(combined_text)}")
             return result
 
-        result["text"] = text
-        result["method"] = "playwright_deep_with_documents"
+        result["text"] = combined_text
+        result["method"] = "playwright_deep_required"
         result["status"] = "Мало текста"
-        result["error"] = f"Получено мало текста: {len(text)} символов."
-        log(f"{company_name}: Playwright вернул мало текста: {len(text)} символов")
+        result["error"] = f"Получено мало текста: {len(combined_text)} символов."
+        log(f"{company_name}: расширенный парсинг вернул мало текста: {len(combined_text)} символов")
         return result
 
     except Exception as exc:
         result["error"] = traceback.format_exc()
         log(f"{company_name}: Playwright ошибка: {repr(exc)}")
+
+        if quick_text and len(quick_text) >= 300:
+            result["text"] = quick_text
+            result["method"] = "requests_fallback_after_playwright_error"
+            result["status"] = "Частично: Playwright не сработал, использован requests"
+            return result
+
         return result
 
 
@@ -1371,6 +1479,8 @@ URL источника:
    - текст до раскрытия блоков;
    - раскрытые элементы;
    - текст после раскрытия блоков;
+   - скрытые DOM-блоки;
+   - Bootstrap FAQ / accordion;
    - найденные ссылки на документы / условия;
    - извлечённый текст из PDF/DOCX/XLSX/CSV;
    - ручной текст пользователя, если он был использован.
@@ -1620,7 +1730,7 @@ def run_pipeline(
             render_live_status(
                 ui=live_ui,
                 status=f"Анализ: {company_name}",
-                step="Парсинг страницы",
+                step="Расширенный парсинг страницы",
                 company=company_name,
                 progress=base_progress,
                 completed=st.session_state.completed_companies,
@@ -1970,9 +2080,10 @@ if client is None:
     )
 
 st.caption(
-    "Приложение сначала пробует requests, затем Playwright: скроллит страницу, раскрывает безопасные "
-    "аккордеоны/FAQ/табы, собирает ссылки на документы и пытается извлечь текст из PDF/DOCX/XLSX/CSV. "
-    "Если сайт не спарсился, в расширенном режиме можно вставить текст вручную."
+    "Расширенный парсинг запускается на любом сайте в любом режиме. "
+    "Приложение использует Playwright: скроллит страницу, раскрывает Bootstrap collapse/accordion/tab через DOM, "
+    "кликает по безопасным FAQ/аккордеонам/табам, собирает скрытый DOM-текст, ссылки на документы "
+    "и пытается извлечь текст из PDF/DOCX/XLSX/CSV."
 )
 
 mode = st.radio(
