@@ -119,6 +119,35 @@ DEFAULT_CUSTOM_PARAMS = [
 ]
 
 
+INDUSTRY_PARAMETER_TEMPLATES = {
+    "Свой список": DEFAULT_CUSTOM_PARAMS,
+    "Банки / кредиты": DEFAULT_CUSTOM_PARAMS,
+    "SaaS / CRM / IT-сервисы": [
+        "URL источника", "Цена / тарифы", "Пробный период", "Основная функциональность",
+        "Интеграции", "Ограничения тарифов", "Поддержка", "SLA", "Безопасность",
+        "Документы", "Как подключить", "Преимущества", "Что не указано на странице", "Статус парсинга",
+    ],
+    "Страхование": [
+        "URL источника", "Стоимость / тариф", "Страховое покрытие", "Исключения", "Франшиза",
+        "Срок действия", "Требования к клиенту", "Документы", "Как оформить", "Преимущества",
+        "Что не указано на странице", "Статус парсинга",
+    ],
+    "Маркетплейсы / e-commerce": [
+        "URL источника", "Комиссии", "Логистика", "Выплаты", "Требования к продавцу",
+        "Ограничения", "Поддержка", "Документы", "Как подключиться", "Преимущества",
+        "Что не указано на странице", "Статус парсинга",
+    ],
+    "Доставка / логистика": [
+        "URL источника", "Стоимость доставки", "Сроки доставки", "География",
+        "Ограничения по весу / габаритам", "Условия подключения", "Интеграции",
+        "Документы", "Поддержка", "Преимущества", "Что не указано на странице", "Статус парсинга",
+    ],
+}
+
+LOW_CONFIDENCE_VALUES = {"низкая", "low", "средняя", "medium"}
+META_COLUMN_SUFFIXES = ["Источник значения", "Фрагмент источника", "Уверенность", "Причина отсутствия"]
+
+
 # =========================
 # ENV / LLM SETTINGS
 # =========================
@@ -169,7 +198,9 @@ defaults = {
         {"name": "", "url": "", "manual_text": ""},
     ],
     "last_df": None,
+    "last_meta_records": [],
     "last_raw_records": [],
+    "last_comparison_insights": [],
 }
 
 for key, value in defaults.items():
@@ -222,7 +253,9 @@ def reset_runtime_state() -> None:
     st.session_state.total_companies = 0
     st.session_state.user_updates = []
     st.session_state.last_df = None
+    st.session_state.last_meta_records = []
     st.session_state.last_raw_records = []
+    st.session_state.last_comparison_insights = []
 
 
 # =========================
@@ -527,6 +560,189 @@ def normalize_record_to_schema(
         record[param] = value
 
     return record
+
+
+
+def normalize_cell_object(value: Any) -> Dict[str, str]:
+    if isinstance(value, dict):
+        cell = {"value": value.get("value", "Не указано"), "evidence": value.get("evidence", ""), "source_type": value.get("source_type", "not_found"), "confidence": value.get("confidence", "низкая"), "missing_reason": value.get("missing_reason", "")}
+    else:
+        text_value = str(value or "Не указано").strip() or "Не указано"
+        cell = {"value": text_value, "evidence": "", "source_type": "not_found" if text_value == "Не указано" else "page", "confidence": "низкая" if text_value == "Не указано" else "средняя", "missing_reason": "Данные не найдены в источнике." if text_value == "Не указано" else ""}
+    return {key: str(val or "").strip() for key, val in cell.items()}
+
+
+def normalize_structured_record_to_schema(raw_record: Dict[str, Any], company_name: str, url: str, params: List[str], parsing_status: str) -> Dict[str, Any]:
+    record = {"Компания": company_name}
+    lower_key_map = {str(key).strip().lower(): key for key in raw_record.keys()}
+    for param in params:
+        if param == "URL источника":
+            record[param] = url if url else "Нет URL / использован ручной текст"
+            continue
+        if param == "Статус парсинга":
+            record[param] = parsing_status
+            continue
+        key = lower_key_map.get(param.lower())
+        cell = normalize_cell_object(raw_record.get(key, "Не указано") if key else "Не указано")
+        record[param] = cell["value"] or "Не указано"
+        record[f"{param} — Источник значения"] = cell["source_type"] or "not_found"
+        record[f"{param} — Фрагмент источника"] = cell["evidence"]
+        record[f"{param} — Уверенность"] = cell["confidence"] or "низкая"
+        record[f"{param} — Причина отсутствия"] = cell["missing_reason"]
+    return record
+
+
+def parse_numeric_value(value: Any) -> Optional[float]:
+    text = str(value or "").lower().replace("\xa0", " ").replace(",", ".")
+    if not text or "не указано" in text:
+        return None
+    numbers = re.findall(r"\d+(?:\.\d+)?", text)
+    if not numbers:
+        return None
+    number = float(numbers[0])
+    if any(word in text for word in ["млрд", "миллиард"]):
+        number *= 1_000_000_000
+    elif any(word in text for word in ["млн", "миллион"]):
+        number *= 1_000_000
+    elif any(word in text for word in ["тыс", "тысяч"]):
+        number *= 1_000
+    return number
+
+
+def is_numeric_comparison_param(param: str) -> bool:
+    param_l = param.lower()
+    return any(token in param_l for token in ["ставк", "пск", "%", "ltv", "сумм", "цен", "стоим", "срок", "комисс", "тариф"])
+
+
+def add_numeric_normalization_columns(df: pd.DataFrame, params: List[str]) -> pd.DataFrame:
+    result = df.copy()
+    for param in params:
+        if param in result.columns and is_numeric_comparison_param(param):
+            result[f"{param} — нормализованное число"] = result[param].apply(parse_numeric_value)
+    return result
+
+
+def merge_record_metadata(final_records: List[Dict[str, Any]], source_records: List[Dict[str, Any]], params: List[str]) -> List[Dict[str, Any]]:
+    source_by_company = {str(item.get("Компания", "")).strip().lower(): item for item in source_records}
+    for record in final_records:
+        source = source_by_company.get(str(record.get("Компания", "")).strip().lower(), {})
+        for param in params:
+            for suffix in META_COLUMN_SUFFIXES:
+                column = f"{param} — {suffix}"
+                if column in source and column not in record:
+                    record[column] = source[column]
+    return final_records
+
+
+def build_verification_prompt(company_name: str, params: List[str], raw_record: Dict[str, Any], source_text: str) -> str:
+    params_json = json.dumps(params, ensure_ascii=False, indent=2)
+    record_json = json.dumps(raw_record, ensure_ascii=False, indent=2)
+    return f"""
+Проверь извлеченные значения по исходному тексту.
+
+Компания:
+{company_name}
+
+Параметры:
+{params_json}
+
+Текущая запись:
+{record_json}
+
+Верни только валидный JSON-объект такого вида:
+{{
+  "updates": {{
+    "Название параметра": {{
+      "value": "...", "evidence": "...", "source_type": "page | document | manual_text | parser_metadata | not_found", "confidence": "высокая | средняя | низкая", "missing_reason": "..."
+    }}
+  }},
+  "notes": "кратко, что было исправлено"
+}}
+
+Проверяй только спорные значения: низкая уверенность, пустой evidence, числовые поля, ставки, суммы, сроки, комиссии, тарифы.
+Не выдумывай факты и не добавляй знания вне текста.
+
+Исходный текст:
+{source_text[:MAX_SOURCE_CHARS]}
+""".strip()
+
+
+def verify_record_with_llm(company_name: str, params: List[str], raw_record: Dict[str, Any], source_text: str, enabled: bool) -> Dict[str, Any]:
+    if not enabled:
+        return raw_record
+    needs_check = False
+    for param in params:
+        cell = normalize_cell_object(raw_record.get(param, "Не указано"))
+        if cell["confidence"].lower() in LOW_CONFIDENCE_VALUES or (cell["value"] != "Не указано" and not cell["evidence"]) or is_numeric_comparison_param(param):
+            needs_check = True
+    if not needs_check:
+        return raw_record
+    try:
+        prompt = build_verification_prompt(company_name, params, raw_record, source_text)
+        response_text = call_llm(prompt)
+        parsed = extract_json_from_text(response_text)
+        updates = parsed.get("updates", {})
+        if isinstance(updates, dict):
+            for key, value in updates.items():
+                if key in params:
+                    raw_record[key] = value
+            log(f"{company_name}: повторная проверка спорных значений выполнена.")
+    except Exception as exc:
+        log(f"{company_name}: повторная проверка не выполнена: {repr(exc)}")
+    return raw_record
+
+
+def build_comparison_insights(df: pd.DataFrame, params: List[str]) -> List[str]:
+    insights = []
+    for param in params:
+        normalized_col = f"{param} — нормализованное число"
+        if param not in df.columns or normalized_col not in df.columns:
+            continue
+        numeric = pd.to_numeric(df[normalized_col], errors="coerce")
+        if numeric.notna().sum() < 2:
+            continue
+        param_l = param.lower()
+        lower_is_better = any(token in param_l for token in ["ставк", "пск", "цен", "стоим", "комисс", "срок"])
+        best_index = numeric.idxmin() if lower_is_better else numeric.idxmax()
+        insights.append(f"{param}: лучшее значение у {df.loc[best_index, 'Компания']} — {df.loc[best_index, param]}")
+    return insights
+
+
+def highlight_best_values(df: pd.DataFrame) -> pd.DataFrame:
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    for numeric_col in [col for col in df.columns if col.endswith("— нормализованное число")]:
+        base_col = numeric_col.replace(" — нормализованное число", "")
+        if base_col not in df.columns:
+            continue
+        numeric = pd.to_numeric(df[numeric_col], errors="coerce")
+        if numeric.notna().sum() < 2:
+            continue
+        base_l = base_col.lower()
+        lower_is_better = any(token in base_l for token in ["ставк", "пск", "цен", "стоим", "комисс", "срок"])
+        best_index = numeric.idxmin() if lower_is_better else numeric.idxmax()
+        styles.loc[best_index, base_col] = "background-color: #d9ead3"
+    return styles
+
+
+def visible_result_columns(df: pd.DataFrame) -> List[str]:
+    return [column for column in df.columns if not column.endswith("— нормализованное число")]
+
+
+def render_result_section(df: pd.DataFrame, params: List[str], editor_key: str) -> pd.DataFrame:
+    insights = build_comparison_insights(df, params)
+    st.session_state.last_comparison_insights = insights
+    if insights:
+        with st.expander("Автоматические выводы и лучшие значения", expanded=True):
+            for insight in insights:
+                st.write(f"• {insight}")
+    with st.expander("Редактор результата перед скачиванием", expanded=True):
+        editable_columns = visible_result_columns(df)
+        edited_df = st.data_editor(df[editable_columns], use_container_width=True, num_rows="fixed", key=editor_key)
+    st.dataframe(df.style.apply(highlight_best_values, axis=None), use_container_width=True)
+    result_df = df.copy()
+    for column in editable_columns:
+        result_df[column] = edited_df[column]
+    return result_df
 
 
 def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -1453,9 +1669,6 @@ def build_extraction_prompt(
     return f"""
 Ты аналитик, который заполняет battle card / сравнительную таблицу по данным с сайта, скрытых блоков, документов или ручного текста пользователя.
 
-Задача:
-Нужно извлечь информацию о продукте / сервисе / предложении компании и заполнить значения строго по заданным параметрам.
-
 Название баттл-карты:
 {battle_card_name}
 
@@ -1471,38 +1684,36 @@ URL источника:
 Параметры, которые нужно заполнить:
 {params_json}
 
+Верни только валидный JSON-объект. Никакого Markdown, пояснений и текста вокруг JSON.
+
+Формат ответа строго такой:
+{{
+  "Название параметра": {{
+    "value": "краткое значение или Не указано",
+    "evidence": "короткий фрагмент исходного текста, подтверждающий значение",
+    "source_type": "page | document | manual_text | parser_metadata | not_found",
+    "confidence": "высокая | средняя | низкая",
+    "missing_reason": "почему данных нет, если value = Не указано"
+  }}
+}}
+
 Правила:
-1. Верни только валидный JSON-объект. Никакого Markdown, пояснений и текста вокруг JSON.
-2. Ключи JSON должны точно совпадать с названиями параметров из списка.
-3. Используй весь предоставленный текст, включая:
-   - метаданные парсинга;
-   - текст до раскрытия блоков;
-   - раскрытые элементы;
-   - текст после раскрытия блоков;
-   - скрытые DOM-блоки;
-   - Bootstrap FAQ / accordion;
-   - найденные ссылки на документы / условия;
-   - извлечённый текст из PDF/DOCX/XLSX/CSV;
-   - ручной текст пользователя, если он был использован.
-4. Если есть извлечённый текст из документа, считай его полноценным источником.
-5. Если есть только ссылка на документ, но текст документа не был извлечён, укажи это в релевантных параметрах.
-6. Если на странице или в ручном тексте нет данных по параметру, укажи "Не указано".
-7. Не выдумывай значения.
-8. Если значение найдено, формулируй кратко, но так, чтобы смысл был понятен.
-9. Если данные противоречивы, напиши: "На странице указано противоречиво: ..." и кратко поясни.
+1. Ключи верхнего уровня должны точно совпадать с названиями параметров из списка.
+2. Каждый параметр должен быть объектом с полями value, evidence, source_type, confidence, missing_reason.
+3. Используй страницу, скрытые DOM-блоки, FAQ/accordion, найденные документы, извлеченный текст PDF/DOCX/XLSX/CSV и ручной текст.
+4. Если есть извлеченный текст из документа, считай его полноценным источником и ставь source_type = "document".
+5. Если данные взяты из ручного текста, ставь source_type = "manual_text".
+6. Если данных нет, value = "Не указано", source_type = "not_found", confidence = "низкая".
+7. Не выдумывай значения и не используй знания вне предоставленного текста.
+8. evidence должен быть коротким подтверждающим фрагментом из исходного текста. Если данных нет, evidence = "".
+9. Если данные противоречивы, напиши в value: "На странице указано противоречиво: ..." и поставь confidence = "низкая".
 10. Для параметра "Что не указано на странице" перечисли важные отсутствующие сведения из заданных параметров.
-11. Для параметра "Статус парсинга" укажи одну из формулировок:
-   - "Данные извлечены"
-   - "Данные частично извлечены"
-   - "На странице мало релевантной информации"
-   - "Использован ручной текст"
+11. Для параметра "Статус парсинга" укажи понятный статус извлечения.
 12. Не добавляй ключи, которых нет в списке параметров.
-13. Не используй знания вне предоставленного текста. Если факта нет в тексте, пиши "Не указано".
 
 Текст для анализа:
 {source_text}
 """.strip()
-
 
 def build_unification_prompt(
     battle_card_name: str,
@@ -1680,6 +1891,7 @@ def run_pipeline(
     selected_companies: List[Dict[str, str]],
     params: List[str],
     use_unification: bool,
+    use_verification: bool = True,
     live_ui: Optional[Dict[str, Any]] = None,
     started_at: Optional[float] = None,
 ) -> pd.DataFrame:
@@ -1791,7 +2003,7 @@ def run_pipeline(
             raw_record = {}
             parsing_status = f"Ошибка парсинга: {parser_error[:300]}" if parser_error else "Ошибка парсинга: нет текста страницы и нет ручного текста"
 
-            normalized = normalize_record_to_schema(
+            normalized = normalize_structured_record_to_schema(
                 raw_record=raw_record,
                 company_name=company_name,
                 url=url,
@@ -1854,6 +2066,13 @@ def run_pipeline(
 
             response_text = call_llm(prompt)
             raw_record = extract_json_from_text(response_text)
+            raw_record = verify_record_with_llm(
+                company_name=company_name,
+                params=params,
+                raw_record=raw_record,
+                source_text=trimmed_text,
+                enabled=use_verification,
+            )
 
             if live_ui:
                 render_live_status(
@@ -1875,7 +2094,7 @@ def run_pipeline(
                 if parser_status != "ОК":
                     parsing_status = f"Данные частично извлечены; статус парсинга: {parser_status}"
 
-            normalized = normalize_record_to_schema(
+            normalized = normalize_structured_record_to_schema(
                 raw_record=raw_record,
                 company_name=company_name,
                 url=url,
@@ -1941,6 +2160,8 @@ def run_pipeline(
         started_at=started_at,
     )
 
+    final_records = merge_record_metadata(final_records, records, params)
+
     columns = ["Компания"] + params
     df = pd.DataFrame(final_records)
 
@@ -1948,9 +2169,12 @@ def run_pipeline(
         if column not in df.columns:
             df[column] = "Не указано"
 
-    df = df[columns]
+    ordered_columns = columns + [column for column in df.columns if column not in columns]
+    df = df[ordered_columns]
+    df = add_numeric_normalization_columns(df, params)
 
     st.session_state.last_df = df
+    st.session_state.last_meta_records = final_records
 
     if live_ui:
         render_live_status(
@@ -2097,6 +2321,11 @@ use_unification = st.checkbox(
     value=True,
 )
 
+use_verification = st.checkbox(
+    "Повторно проверять спорные значения через LLM",
+    value=True,
+)
+
 st.divider()
 
 if mode == "Быстрый":
@@ -2149,6 +2378,14 @@ else:
     )
 
     st.markdown("#### Параметры сравнения")
+
+    template_name = st.selectbox(
+        "Шаблон параметров",
+        list(INDUSTRY_PARAMETER_TEMPLATES.keys()),
+    )
+
+    if template_name != "Свой список":
+        st.session_state.custom_params_text = "\n".join(INDUSTRY_PARAMETER_TEMPLATES[template_name])
 
     params_text = st.text_area(
         "Введите параметры списком или текстом. Можно писать каждый параметр с новой строки, через запятую или через точку с запятой.",
@@ -2211,12 +2448,14 @@ if run_button:
             selected_companies=selected_companies,
             params=params,
             use_unification=use_unification,
+            use_verification=use_verification,
             live_ui=live_ui,
             started_at=started_at,
         )
 
         st.success("Готово. Таблица сформирована.")
-        st.dataframe(df, use_container_width=True)
+        df = render_result_section(df, params, editor_key="result_editor_current")
+        st.session_state.last_df = df
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
         excel_bytes = dataframe_to_excel_bytes(df)
@@ -2264,10 +2503,10 @@ if run_button:
 
 if st.session_state.last_df is not None and not run_button:
     st.subheader("Последний результат")
-    st.dataframe(st.session_state.last_df, use_container_width=True)
+    last_df = render_result_section(st.session_state.last_df, params, editor_key="result_editor_last")
 
-    csv_bytes = st.session_state.last_df.to_csv(index=False).encode("utf-8-sig")
-    excel_bytes = dataframe_to_excel_bytes(st.session_state.last_df)
+    csv_bytes = last_df.to_csv(index=False).encode("utf-8-sig")
+    excel_bytes = dataframe_to_excel_bytes(last_df)
 
     download_col1, download_col2 = st.columns(2)
 
