@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://competitive-research.local/schemas/research_run.schema.json",
+  "title": "ResearchRun",
+  "type": "object",
+  "required": ["run_id", "title", "research_type", "competitors", "template", "stages", "artifacts", "cells", "insights", "logs"],
+  "properties": {
+    "run_id": {"type": "string"},
+    "title": {"type": "string"},
+    "research_type": {"type": "string"},
+    "competitors": {"type": "array"},
+    "template": {"type": "object"},
+    "stages": {"type": "array"},
+    "artifacts": {"type": "array"},
+    "cells": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {"$ref": "evidence_cell.schema.json"}
+      }
+    },
+    "insights": {"type": "object"},
+    "logs": {"type": "array"},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"}
+  }
+}

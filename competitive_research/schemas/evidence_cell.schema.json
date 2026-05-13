@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://competitive-research.local/schemas/evidence_cell.schema.json",
+  "title": "EvidenceCell",
+  "type": "object",
+  "required": [
+    "extracted_value",
+    "normalized_value",
+    "source_url",
+    "source_fragment",
+    "confidence_score",
+    "extraction_method",
+    "timestamp",
+    "status"
+  ],
+  "properties": {
+    "extracted_value": {"type": "string"},
+    "normalized_value": {"type": "string"},
+    "canonical_field": {"type": "string"},
+    "source_url": {"type": "string"},
+    "source_fragment": {"type": "string"},
+    "confidence_score": {"type": "number", "minimum": 0, "maximum": 1},
+    "extraction_method": {"type": "string"},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "status": {
+      "type": "string",
+      "enum": ["confirmed", "ambiguous", "conflicting", "missing", "inferred", "needs_review"]
+    },
+    "reasoning": {"type": "string"},
+    "raw_field": {"type": "string"}
+  },
+  "additionalProperties": false
+}
