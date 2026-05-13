@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 from .config import AppConfig
 from .models import CellStatus, EvidenceCell
+from .parser import repair_mojibake
 
 
 class LLMProvider(ABC):
@@ -115,19 +116,23 @@ def cells_from_llm_payload(payload: Dict[str, Any], source_url: str) -> List[Evi
             status = CellStatus.NEEDS_REVIEW.value
         result.append(
             EvidenceCell(
-                extracted_value=str(item.get("extracted_value", "") or ""),
-                normalized_value=str(item.get("normalized_value", "") or item.get("extracted_value", "") or ""),
-                canonical_field=str(item.get("canonical_field", "") or item.get("raw_field", "") or ""),
+                extracted_value=clean_cell_text(item.get("extracted_value", "")),
+                normalized_value=clean_cell_text(item.get("normalized_value", "") or item.get("extracted_value", "")),
+                canonical_field=clean_cell_text(item.get("canonical_field", "") or item.get("raw_field", "")),
                 source_url=str(item.get("source_url", "") or source_url),
-                source_fragment=str(item.get("source_fragment", "") or ""),
+                source_fragment=clean_cell_text(item.get("source_fragment", "")),
                 confidence_score=float(item.get("confidence_score", 0.0) or 0.0),
                 extraction_method=str(item.get("extraction_method", "llm_structured_extraction")),
                 status=CellStatus(status),
-                reasoning=str(item.get("reasoning", "") or ""),
-                raw_field=str(item.get("raw_field", "") or ""),
+                reasoning=clean_cell_text(item.get("reasoning", "")),
+                raw_field=clean_cell_text(item.get("raw_field", "")),
             )
         )
     return result
+
+
+def clean_cell_text(value: Any) -> str:
+    return repair_mojibake(str(value or "")).strip()
 
 
 def extract_prompt_list(prompt: str, marker: str) -> List[str]:

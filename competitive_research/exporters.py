@@ -34,17 +34,44 @@ INSIGHT_SECTION_LABELS = {
 
 
 def cells_to_dataframe(cells: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    fields: List[str] = []
+    for competitor_fields in cells.values():
+        for field in competitor_fields.keys():
+            if field not in fields:
+                fields.append(field)
+
+    rows: List[Dict[str, object]] = []
+    for field in fields:
+        row: Dict[str, object] = {"Параметр": field}
+        for competitor, competitor_fields in cells.items():
+            cell = competitor_fields.get(field)
+            if not cell:
+                row[competitor] = ""
+                continue
+            data = cell.to_dict() if hasattr(cell, "to_dict") else cell
+            row[competitor] = data.get("normalized_value") or data.get("extracted_value") or ""
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def cells_to_evidence_dataframe(cells: Dict[str, Dict[str, object]]) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     for competitor, fields in cells.items():
-        row: Dict[str, object] = {"Конкурент": competitor}
         for field, cell in fields.items():
             data = cell.to_dict() if hasattr(cell, "to_dict") else cell
-            row[field] = data.get("normalized_value") or data.get("extracted_value") or ""
-            row[f"{field} · статус"] = STATUS_LABELS.get(str(data.get("status", "")), data.get("status", ""))
-            row[f"{field} · уверенность"] = data.get("confidence_score", 0)
-            row[f"{field} · источник"] = data.get("source_url", "")
-            row[f"{field} · фрагмент"] = data.get("source_fragment", "")
-        rows.append(row)
+            row = {
+                "Конкурент": competitor,
+                "Параметр": field,
+                "Извлечено": data.get("extracted_value", ""),
+                "Нормализовано": data.get("normalized_value", ""),
+                "Статус": STATUS_LABELS.get(str(data.get("status", "")), data.get("status", "")),
+                "Уверенность": data.get("confidence_score", 0),
+                "Источник": data.get("source_url", ""),
+                "Фрагмент": data.get("source_fragment", ""),
+                "Метод": data.get("extraction_method", ""),
+                "Обоснование": data.get("reasoning", ""),
+            }
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -52,10 +79,18 @@ def export_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def export_excel(df: pd.DataFrame, insights: Dict[str, object], logs: List[Dict[str, str]], diff: List[Dict[str, object]]) -> bytes:
+def export_excel(
+    df: pd.DataFrame,
+    insights: Dict[str, object],
+    logs: List[Dict[str, str]],
+    diff: List[Dict[str, object]],
+    evidence_df: pd.DataFrame | None = None,
+) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Таблица")
+        if evidence_df is not None and not evidence_df.empty:
+            evidence_df.to_excel(writer, index=False, sheet_name="Источники")
         pd.DataFrame(flatten_insights(insights)).to_excel(writer, index=False, sheet_name="Выводы")
         pd.DataFrame(logs).to_excel(writer, index=False, sheet_name="Логи")
         pd.DataFrame(diff).to_excel(writer, index=False, sheet_name="Изменения")

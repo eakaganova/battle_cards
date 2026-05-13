@@ -23,6 +23,11 @@ EXPAND_TEXT_RE = re.compile(
     re.I,
 )
 
+TAB_TEXT_RE = re.compile(
+    r"тариф|услов|документ|погашен|вопрос|ответ|требован|ставк|пск|комисс|страх|оформ|получ|faq|documents|tariff|terms",
+    re.I,
+)
+
 
 def retry(operation: Callable[[], SourceArtifact], attempts: int, on_error: Callable[[str], None]) -> SourceArtifact:
     last_error: Optional[Exception] = None
@@ -98,11 +103,12 @@ def fetch_with_requests(competitor: str, url: str, config: AppConfig) -> SourceA
         },
     )
     response.raise_for_status()
+    html_text = decode_response_text(response)
     try:
-        soup = BeautifulSoup(response.text, "lxml")
+        soup = BeautifulSoup(html_text, "lxml")
     except Exception:
-        soup = BeautifulSoup(response.text, "html.parser")
-    return artifact_from_soup(competitor, url, response.text, soup, "requests_bs4")
+        soup = BeautifulSoup(html_text, "html.parser")
+    return artifact_from_soup(competitor, url, html_text, soup, "requests_bs4")
 
 
 def merge_artifacts(static_artifact: SourceArtifact, browser_artifact: SourceArtifact) -> SourceArtifact:
@@ -152,6 +158,7 @@ def fetch_with_playwright(
             click_cookie_banners(page)
             scroll_deep(page, progress, competitor)
             clicked = click_expandable(page, progress, competitor)
+            tab_texts = click_tabs_and_collect_text(page, progress, competitor)
             modal_texts = collect_modal_texts(page, progress, competitor)
             html = page.content()
             try:
@@ -159,10 +166,12 @@ def fetch_with_playwright(
             except Exception:
                 soup = BeautifulSoup(html, "html.parser")
             artifact = artifact_from_soup(competitor, url, html, soup, "playwright_deep")
-            artifact.modal_texts = modal_texts
+            artifact.modal_texts = modal_texts + tab_texts
             artifact.hidden_text = collect_hidden_text(soup)
-            if clicked:
-                artifact.status = f"success_expanded_{clicked}_controls"
+            if clicked or tab_texts:
+                artifact.raw_text = merge_text_blocks([artifact.raw_text, "=== ТЕКСТ ИЗ ВКЛАДОК ===\n" + "\n\n".join(tab_texts)])
+                artifact.cleaned_text = clean_text(artifact.raw_text)
+                artifact.status = f"success_expanded_{clicked}_controls_{len(tab_texts)}_tabs"
             return artifact
         finally:
             context.close()
@@ -203,7 +212,7 @@ def scroll_deep(page, progress: ProgressCallback, competitor: str) -> None:
 
 def click_expandable(page, progress: ProgressCallback, competitor: str) -> int:
     clicked = 0
-    candidates = page.locator("button, a, [role='button'], summary, [aria-expanded='false']")
+    candidates = page.locator("button, a, [role='button'], summary, [aria-expanded='false'], [data-qa-type*='accordion']")
     count = min(candidates.count(), 160)
     for index in range(count):
         try:
@@ -221,6 +230,82 @@ def click_expandable(page, progress: ProgressCallback, competitor: str) -> int:
             continue
     progress("accordion", competitor, f"Раскрыто интерактивных элементов: {clicked}.")
     return clicked
+
+
+def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: str) -> List[str]:
+    collected: List[str] = []
+    selectors = [
+        "[role='tab']",
+        "button[data-qa-type*='segmented-item']",
+        "[data-qa-type*='segmented-item']",
+        "button[aria-selected]",
+        "[role='tablist'] button",
+    ]
+    seen_labels = set()
+    clicked = 0
+    for selector in selectors:
+        try:
+            candidates = page.locator(selector)
+            count = min(candidates.count(), 80)
+        except Exception:
+            continue
+        for index in range(count):
+            try:
+                element = candidates.nth(index)
+                label = get_interactive_label(element)
+                if not label or label in seen_labels:
+                    continue
+                if not TAB_TEXT_RE.search(label):
+                    continue
+                seen_labels.add(label)
+                before_url = page.url
+                element.scroll_into_view_if_needed(timeout=1200)
+                element.click(timeout=1200)
+                page.wait_for_timeout(700)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=2500)
+                except Exception:
+                    pass
+                if page.url != before_url:
+                    page.go_back(wait_until="domcontentloaded", timeout=5000)
+                    continue
+                text = collect_current_main_text(page)
+                if text:
+                    collected.append(f"Вкладка: {label}\n{text}")
+                clicked += 1
+            except Exception:
+                continue
+    progress("tabs", competitor, f"Открыто вкладок/переключателей: {clicked}.")
+    return collected
+
+
+def get_interactive_label(element) -> str:
+    parts: List[str] = []
+    for getter in [
+        lambda: element.inner_text(timeout=500),
+        lambda: element.get_attribute("aria-label"),
+        lambda: element.get_attribute("title"),
+        lambda: element.get_attribute("data-qa-type"),
+    ]:
+        try:
+            value = getter()
+            if value:
+                parts.append(str(value))
+        except Exception:
+            pass
+    return clean_text(" ".join(parts))[:160]
+
+
+def collect_current_main_text(page) -> str:
+    selectors = ["main", "[role='main']", "article", "body"]
+    for selector in selectors:
+        try:
+            text = clean_text(page.locator(selector).first.inner_text(timeout=1200))
+            if len(text) > 120:
+                return text
+        except Exception:
+            continue
+    return ""
 
 
 def collect_modal_texts(page, progress: ProgressCallback, competitor: str) -> List[str]:
@@ -416,10 +501,61 @@ def format_tables(tables: List[Dict[str, object]]) -> str:
 
 
 def clean_text(text: str) -> str:
-    text = re.sub(r"\r", "\n", text or "")
+    text = repair_mojibake(text or "")
+    text = re.sub(r"\r", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def looks_like_mojibake(text: str) -> bool:
+    if not text:
+        return False
+    sample = text[:20000]
+    bad_tokens = ["Ð", "Ñ", "Â", "â€", "â€™", "â€œ", "â€", "â€“", "â€”", "�"]
+    bad_count = sum(sample.count(token) for token in bad_tokens)
+    cyrillic_count = len(re.findall(r"[А-Яа-яЁё]", sample))
+    return bad_count >= 3 and bad_count > cyrillic_count * 0.08
+
+
+def repair_mojibake(text: str) -> str:
+    if not text:
+        return ""
+    repaired = text
+    for _ in range(2):
+        if not looks_like_mojibake(repaired):
+            break
+        candidates = [repaired]
+        for source_encoding in ("latin1", "cp1252"):
+            try:
+                candidates.append(repaired.encode(source_encoding, errors="ignore").decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+        repaired = min(candidates, key=mojibake_score)
+    return normalize_unicode_punctuation(repaired)
+
+
+def mojibake_score(text: str) -> int:
+    bad_tokens = ["Ð", "Ñ", "Â", "â€", "â€™", "â€œ", "â€", "â€“", "â€”", "�"]
+    return sum(text.count(token) for token in bad_tokens)
+
+
+def normalize_unicode_punctuation(text: str) -> str:
+    replacements = {
+        "\u00a0": " ",
+        "Â ": " ",
+        "Â": "",
+        "â€”": "—",
+        "â€“": "–",
+        "â€‘": "‑",
+        "â€œ": "«",
+        "â€": "»",
+        "â€™": "’",
+        "â€¦": "…",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
@@ -492,3 +628,24 @@ def chunk_relevance_score(chunk: str, keywords: List[str]) -> int:
 
 def artifact_to_cache_value(artifact: SourceArtifact) -> Dict[str, object]:
     return asdict(artifact)
+
+
+def decode_response_text(response: requests.Response) -> str:
+    content_type = response.headers.get("content-type", "")
+    charset_match = re.search(r"charset=([\w.-]+)", content_type, re.I)
+    encodings = []
+    if charset_match:
+        encodings.append(charset_match.group(1))
+    if response.encoding:
+        encodings.append(response.encoding)
+    if response.apparent_encoding:
+        encodings.append(response.apparent_encoding)
+    encodings.extend(["utf-8", "cp1251"])
+    for encoding in unique_list(encodings):
+        try:
+            decoded = response.content.decode(encoding, errors="replace")
+            if not looks_like_mojibake(decoded):
+                return decoded
+        except Exception:
+            continue
+    return repair_mojibake(response.text)
