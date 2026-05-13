@@ -22,14 +22,19 @@ or
 ```powershell
 $env:YANDEX_API_KEY="..."
 $env:YANDEX_FOLDER="..."
+$env:YANDEX_MODEL="gpt-oss-120b/latest"
 $env:LLM_PROVIDER="yandex"
 ```
+
+For Yandex, keep `YANDEX_MODEL` as a short model path such as `gpt-oss-120b/latest` or `yandexgpt/latest`.
+The app builds the full model URI internally as `gpt://<YANDEX_FOLDER>/<YANDEX_MODEL>`.
 
 ## Architecture
 
 - `competitive_research/parser.py` handles Playwright/BeautifulSoup extraction, dynamic content, accordions, hidden text, FAQ, tables, document links and manual fallback.
 - `competitive_research/pipeline.py` orchestrates the 14-stage pipeline with statuses, logs and graceful degradation.
 - `competitive_research/models.py` defines typed JSON-first entities, including every battle-card cell evidence payload.
+- `competitive_research/presets.py` keeps the ready banking presets: КНЗ, КНА, cash loan banks, their URLs and comparison schemas.
 - `competitive_research/llm.py` isolates provider access and includes an offline fallback.
 - `competitive_research/normalization.py` separates raw extraction, semantic normalization and canonical schema alignment.
 - `competitive_research/storage.py` saves versioned research runs and computes diffs.

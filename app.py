@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -27,13 +28,13 @@ from competitive_research.models import (
     ResearchTemplate,
 )
 from competitive_research.pipeline import ResearchPipeline
+from competitive_research.presets import preset_competitors, preset_groups, preset_names, preset_research_type
 from competitive_research.storage import ResearchStorage, diff_runs
 from competitive_research.ui_components import (
     inject_workspace_css,
     render_insights,
     render_live_logs,
     render_review_table,
-    render_stage_timeline,
     template_editor,
 )
 
@@ -57,11 +58,14 @@ def init_state() -> None:
         "current_run": None,
         "current_progress": 0.0,
         "current_message": "Готов к запуску.",
+        "run_started_at": None,
         "competitors": [
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
         ],
+        "active_preset": "Custom / manual setup",
+        "active_template_groups": DEFAULT_TEMPLATE_GROUPS,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -98,13 +102,40 @@ def run_event(run: ResearchRun, stage: str, message: str, progress: float) -> No
     st.session_state.current_run = run
     st.session_state.current_progress = progress
     st.session_state.current_message = f"{stage}: {message}"
-    progress_placeholder.progress(progress, text=st.session_state.current_message)
-    timeline_placeholder.empty()
-    with timeline_placeholder.container():
-        render_stage_timeline(run)
+    status_placeholder.empty()
+    with status_placeholder.container():
+        render_compact_runtime_status()
     logs_placeholder.empty()
-    with logs_placeholder.container():
+    with logs_placeholder.expander("Технические логи", expanded=False):
         render_live_logs(run)
+
+
+def elapsed_runtime_text() -> str:
+    started_at = st.session_state.get("run_started_at")
+    if not started_at:
+        return "00:00"
+    elapsed = int(time.time() - started_at)
+    minutes, seconds = divmod(elapsed, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def render_compact_runtime_status() -> None:
+    progress_percent = int(float(st.session_state.current_progress or 0.0) * 100)
+    st.markdown(
+        f"""
+        <div class="runtime-line">
+            <div><strong>Статус:</strong> {st.session_state.current_message}</div>
+            <div class="runtime-meta">
+                <span>Время: {elapsed_runtime_text()}</span>
+                <span>Прогресс: {progress_percent}%</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def competitor_editor() -> List[CompetitorInput]:
@@ -190,6 +221,18 @@ st.caption("Evidence-first battle-cards with visible pipeline, parser diagnostic
 
 with st.sidebar:
     st.header("Research setup")
+    preset_options = ["Custom / manual setup"] + preset_names()
+    active_preset_index = preset_options.index(st.session_state.active_preset) if st.session_state.active_preset in preset_options else 0
+    selected_preset = st.selectbox("Готовый банковский пресет", preset_options, index=active_preset_index)
+    if st.button("Загрузить пресет", use_container_width=True):
+        st.session_state.active_preset = selected_preset
+        if selected_preset != "Custom / manual setup":
+            st.session_state.competitors = preset_competitors(selected_preset)
+            st.session_state.active_template_groups = preset_groups(selected_preset)
+            st.session_state.current_message = f"Загружен пресет: {selected_preset}"
+            st.rerun()
+        st.session_state.active_template_groups = DEFAULT_TEMPLATE_GROUPS
+        st.rerun()
     title = st.text_input("Название исследования", value="Competitive battle-card")
     research_type = st.selectbox("Тип исследования", RESEARCH_TYPES, index=1)
     audience = st.selectbox("Аудитория выводов", ["Executive", "Product", "Sales", "Marketing", "Risk / Compliance"], index=0)
@@ -213,9 +256,9 @@ with st.sidebar:
     st.caption(f"LLM provider: {provider_label}")
 
 default_template = ResearchTemplate(
-    name=f"{research_type} template",
-    research_type=research_type,
-    groups=DEFAULT_TEMPLATE_GROUPS,
+    name=st.session_state.active_preset if st.session_state.active_preset != "Custom / manual setup" else f"{research_type} template",
+    research_type=preset_research_type(st.session_state.active_preset) if st.session_state.active_preset != "Custom / manual setup" else research_type,
+    groups=st.session_state.active_template_groups,
     audience=audience,
     detail_level=detail_level,
 )
@@ -228,22 +271,22 @@ with left:
     run_button = st.button("Запустить research pipeline", type="primary", use_container_width=True)
 
 with right:
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Competitors", len(competitors))
-    metric_cols[1].metric("Parameters", len(template.parameters))
-    metric_cols[2].metric("Saved runs", len(previous_runs))
-    metric_cols[3].metric("Pipeline stages", 14)
+    context_cols = st.columns(3)
+    context_cols[0].caption(f"Конкурентов: {len(competitors)}")
+    context_cols[1].caption(f"Параметров: {len(template.parameters)}")
+    context_cols[2].caption(f"Сохранённых исследований: {len(previous_runs)}")
 
-    progress_placeholder = st.empty()
-    progress_placeholder.progress(st.session_state.current_progress, text=st.session_state.current_message)
-    timeline_placeholder = st.container()
-    with timeline_placeholder:
-        render_stage_timeline(st.session_state.current_run)
+    status_placeholder = st.empty()
+    with status_placeholder.container():
+        render_compact_runtime_status()
     logs_placeholder = st.container()
-    with logs_placeholder:
+    with logs_placeholder.expander("Технические логи", expanded=False):
         render_live_logs(st.session_state.current_run)
 
 if run_button:
+    st.session_state.run_started_at = time.time()
+    st.session_state.current_progress = 0.0
+    st.session_state.current_message = "Запуск pipeline"
     previous_data = None
     if previous_choice != "Нет":
         previous_run_id = previous_choice.split(" · ", 1)[0]
@@ -261,6 +304,8 @@ if run_button:
         on_event=run_event,
     )
     st.session_state.current_run = run
+    st.session_state.current_progress = 1.0
+    st.session_state.current_message = f"Готово: исследование сохранено {run.run_id}"
     st.success(f"Исследование сохранено: {run.run_id}")
 
 run = st.session_state.current_run
