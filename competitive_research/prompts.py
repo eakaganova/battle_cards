@@ -100,7 +100,7 @@ def build_analytics_prompt(title: str, research_type: str, table_json: str, audi
   "sales_insights": ["..."],
   "ux_insights": ["..."],
   "product_conclusions": ["..."],
-  "swot": {{"strengths": ["..."], "weaknesses": ["..."], "opportunities": ["..."], "threats": ["..."]}}},
+  "swot": {{"strengths": ["..."], "weaknesses": ["..."], "opportunities": ["..."], "threats": ["..."]}},
   "positioning_analysis": ["..."],
   "value_proposition_comparison": ["..."],
   "uncertainty_notes": ["..."]
