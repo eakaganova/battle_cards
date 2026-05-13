@@ -18,6 +18,22 @@ STATUS_COLORS = {
 }
 
 
+STATUS_LABELS = {
+    "confirmed": "подтверждено",
+    "ambiguous": "неоднозначно",
+    "conflicting": "конфликт",
+    "missing": "нет данных",
+    "inferred": "выведено",
+    "needs_review": "нужна проверка",
+}
+
+STATUS_VALUES = {label: value for value, label in STATUS_LABELS.items()}
+
+
+def status_label(status: str) -> str:
+    return STATUS_LABELS.get(status, status)
+
+
 def inject_workspace_css() -> None:
     st.markdown(
         """
@@ -71,7 +87,7 @@ def render_live_logs(run: ResearchRun | None, height: int = 240) -> None:
 
 
 def render_review_table(run: ResearchRun) -> Dict[str, Dict[str, Dict[str, object]]]:
-    st.subheader("Interactive review")
+    st.subheader("Проверка данных")
     edited: Dict[str, Dict[str, Dict[str, object]]] = {}
     for competitor, fields in run.cells.items():
         with st.expander(competitor, expanded=True):
@@ -80,12 +96,12 @@ def render_review_table(run: ResearchRun) -> Dict[str, Dict[str, Dict[str, objec
                 rows.append(
                     {
                         "Параметр": field,
-                        "Raw": cell.extracted_value,
-                        "Normalized": cell.normalized_value,
-                        "Status": cell.status.value,
-                        "Confidence": cell.confidence_score,
-                        "Source fragment": cell.source_fragment,
-                        "Reasoning": cell.reasoning,
+                        "Извлечено": cell.extracted_value,
+                        "Нормализовано": cell.normalized_value,
+                        "Статус": status_label(cell.status.value),
+                        "Уверенность": cell.confidence_score,
+                        "Фрагмент источника": cell.source_fragment,
+                        "Обоснование": cell.reasoning,
                     }
                 )
             df = pd.DataFrame(rows)
@@ -95,20 +111,20 @@ def render_review_table(run: ResearchRun) -> Dict[str, Dict[str, Dict[str, objec
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "Status": st.column_config.SelectboxColumn("Status", options=[status.value for status in CellStatus]),
-                    "Confidence": st.column_config.NumberColumn("Confidence", min_value=0.0, max_value=1.0, step=0.05),
-                    "Source fragment": st.column_config.TextColumn("Source fragment", width="large"),
-                    "Reasoning": st.column_config.TextColumn("Reasoning", width="large"),
+                    "Статус": st.column_config.SelectboxColumn("Статус", options=[status_label(status.value) for status in CellStatus]),
+                    "Уверенность": st.column_config.NumberColumn("Уверенность", min_value=0.0, max_value=1.0, step=0.05),
+                    "Фрагмент источника": st.column_config.TextColumn("Фрагмент источника", width="large"),
+                    "Обоснование": st.column_config.TextColumn("Обоснование", width="large"),
                 },
             )
             edited[competitor] = {
                 row["Параметр"]: {
-                    "extracted_value": row["Raw"],
-                    "normalized_value": row["Normalized"],
-                    "status": row["Status"],
-                    "confidence_score": row["Confidence"],
-                    "source_fragment": row["Source fragment"],
-                    "reasoning": row["Reasoning"],
+                    "extracted_value": row["Извлечено"],
+                    "normalized_value": row["Нормализовано"],
+                    "status": STATUS_VALUES.get(row["Статус"], row["Статус"]),
+                    "confidence_score": row["Уверенность"],
+                    "source_fragment": row["Фрагмент источника"],
+                    "reasoning": row["Обоснование"],
                 }
                 for _, row in edited_df.iterrows()
             }
@@ -116,24 +132,24 @@ def render_review_table(run: ResearchRun) -> Dict[str, Dict[str, Dict[str, objec
 
 
 def render_insights(insights: Dict[str, object]) -> None:
-    st.subheader("AI analytics")
-    tabs = st.tabs(["Summary", "Strategy", "Sales/UX", "SWOT", "Uncertainty"])
+    st.subheader("AI-аналитика")
+    tabs = st.tabs(["Резюме", "Стратегия", "Продажи и UX", "SWOT", "Неопределённость"])
     with tabs[0]:
-        render_list("Executive summary", insights.get("executive_summary", []))
-        render_list("Product conclusions", insights.get("product_conclusions", []))
+        render_list("Краткое резюме", insights.get("executive_summary", []))
+        render_list("Продуктовые выводы", insights.get("product_conclusions", []))
     with tabs[1]:
-        render_list("Competitive advantages", insights.get("competitive_advantages", []))
-        render_list("Gaps", insights.get("gaps", []))
-        render_list("Recommendations", insights.get("recommendations", []))
-        render_list("Positioning", insights.get("positioning_analysis", []))
+        render_list("Конкурентные преимущества", insights.get("competitive_advantages", []))
+        render_list("Пробелы", insights.get("gaps", []))
+        render_list("Рекомендации", insights.get("recommendations", []))
+        render_list("Позиционирование", insights.get("positioning_analysis", []))
     with tabs[2]:
-        render_list("Sales insights", insights.get("sales_insights", []))
-        render_list("UX insights", insights.get("ux_insights", []))
-        render_list("Value proposition", insights.get("value_proposition_comparison", []))
+        render_list("Выводы для продаж", insights.get("sales_insights", []))
+        render_list("UX-выводы", insights.get("ux_insights", []))
+        render_list("Сравнение ценностных предложений", insights.get("value_proposition_comparison", []))
     with tabs[3]:
-        st.json(insights.get("swot", {}), expanded=True)
+        render_swot(insights.get("swot", {}))
     with tabs[4]:
-        render_list("Uncertainty notes", insights.get("uncertainty_notes", []))
+        render_list("Замечания по неопределённости", insights.get("uncertainty_notes", []))
         st.json(insights.get("conflicts", {}), expanded=False)
 
 
@@ -148,8 +164,22 @@ def render_list(title: str, items: object) -> None:
         st.caption("Нет данных.")
 
 
+def render_swot(swot: object) -> None:
+    if not isinstance(swot, dict) or not swot:
+        st.caption("Нет данных.")
+        return
+    title_map = {
+        "strengths": "Сильные стороны",
+        "weaknesses": "Слабые стороны",
+        "opportunities": "Возможности",
+        "threats": "Риски",
+    }
+    for key, title in title_map.items():
+        render_list(title, swot.get(key, []))
+
+
 def template_editor(default_template: ResearchTemplate) -> ResearchTemplate:
-    st.markdown("#### Battle-card constructor")
+    st.markdown("#### Конструктор сравнительной таблицы")
     groups: Dict[str, List[str]] = {}
     for group, values in default_template.groups.items():
         text = st.text_area(group, value="\n".join(values), height=150, key=f"group_{group}")

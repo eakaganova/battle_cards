@@ -8,8 +8,8 @@ from .config import AppConfig
 from .llm import HeuristicProvider, cells_from_llm_payload, provider_from_config
 from .models import CompetitorInput, EvidenceCell, ResearchRun, ResearchTemplate, StageStatus
 from .normalization import align_cells_to_schema, detect_conflicts
-from .parser import chunk_text, fetch_source
-from .prompts import build_analytics_prompt, build_extraction_prompt
+from .parser import chunk_text, fetch_source, prioritize_chunks
+from .prompts import EXTRACTION_PROMPT_VERSION, build_analytics_prompt, build_extraction_prompt
 from .storage import ResearchStorage, new_run_id
 
 
@@ -52,7 +52,7 @@ class ResearchPipeline:
         run.stage("Получение URL").finish(StageStatus.SUCCESS, competitors=len(valid_competitors))
 
         artifacts = []
-        self._stage(run, "Парсинг", "Начинаю сбор страниц и fallback-источников.", on_event, 0.08)
+        self._stage(run, "Парсинг", "Начинаю сбор страниц и резервных источников.", on_event, 0.08)
         for index, competitor in enumerate(valid_competitors, start=1):
             run.log("INFO", "Сбор источника начат.", "Парсинг", competitor.display_name())
             artifact = fetch_source(
@@ -81,7 +81,11 @@ class ResearchPipeline:
 
         self._stage(run, "Chunking", "Разбиваю источники на chunks для контролируемой LLM-обработки.", on_event, 0.45)
         chunks_by_competitor = {
-            artifact.competitor: chunk_text(artifact.cleaned_text, self.config.chunk_size, self.config.chunk_overlap)
+            artifact.competitor: prioritize_chunks(
+                chunk_text(artifact.cleaned_text, self.config.chunk_size, self.config.chunk_overlap),
+                template.parameters,
+                research_type,
+            )
             for artifact in artifacts
         }
         run.stage("Chunking").finish(StageStatus.SUCCESS, chunks=sum(len(chunks) for chunks in chunks_by_competitor.values()))
@@ -93,7 +97,7 @@ class ResearchPipeline:
             chunks = chunks_by_competitor.get(artifact.competitor, [])
             for chunk_index, chunk in enumerate(chunks[:8], start=1):
                 prompt = build_extraction_prompt(artifact.competitor, artifact.url, research_type, template.parameters, chunk)
-                cache_key = f"{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
+                cache_key = f"parser_v2|{EXTRACTION_PROMPT_VERSION}|{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
                 payload = self.cache.get("llm_extraction", cache_key)
                 if payload is None:
                     payload = self._complete_json_with_fallback(prompt, run, "LLM extraction", artifact.competitor)
@@ -124,7 +128,7 @@ class ResearchPipeline:
         run.stage("Проверка конфликтов").finish(status, conflicts=sum(len(v) for v in conflicts.values()))
         run.insights["conflicts"] = conflicts
 
-        self._stage(run, "Генерация выводов", "Генерирую executive summary, SWOT и рекомендации.", on_event, 0.88)
+        self._stage(run, "Генерация выводов", "Генерирую краткое резюме, SWOT и рекомендации.", on_event, 0.88)
         run.insights.update(self.generate_insights(run, audience, detail_level))
         run.stage("Генерация выводов").finish(StageStatus.SUCCESS)
 
@@ -133,7 +137,7 @@ class ResearchPipeline:
         run.stage("Экспорт").finish(StageStatus.SUCCESS, path=str(self.config.runs_dir / f"{run.run_id}.json"))
         self.storage.save_run(run)
         if on_event:
-            on_event(run, "Готово", "Исследование сохранено и готово к review/export.", 1.0)
+            on_event(run, "Готово", "Исследование сохранено и готово к проверке и экспорту.", 1.0)
         return run
 
     def generate_insights(self, run: ResearchRun, audience: str, detail_level: str) -> Dict[str, object]:
@@ -166,7 +170,7 @@ class ResearchPipeline:
         except Exception as exc:
             run.log(
                 "ERROR",
-                f"LLM provider error: {exc}. Pipeline continues with heuristic fallback and low confidence.",
+                f"Ошибка LLM-провайдера: {exc}. Pipeline продолжит работу в эвристическом режиме с низкой уверенностью.",
                 stage,
                 competitor,
             )
@@ -201,12 +205,12 @@ def heuristic_insights(table: Dict[str, Dict[str, Dict[str, object]]]) -> Dict[s
     return {
         "executive_summary": [
             "Исследование собрано в evidence-first формате.",
-            "Выводы ограничены полнотой источников и отмеченными low-confidence ячейками.",
+            "Выводы ограничены полнотой источников и ячейками с низкой уверенностью.",
         ],
         "strengths_weaknesses": {},
         "competitive_advantages": [],
         "gaps": missing[:20],
-        "recommendations": ["Проверить ячейки needs_review и conflicting перед презентацией результатов."],
+        "recommendations": ["Проверить ячейки со статусами needs_review и conflicting перед презентацией результатов."],
         "sales_insights": [],
         "ux_insights": [],
         "product_conclusions": [],

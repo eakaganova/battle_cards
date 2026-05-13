@@ -7,6 +7,32 @@ from typing import Dict, List
 import pandas as pd
 
 
+STATUS_LABELS = {
+    "confirmed": "подтверждено",
+    "ambiguous": "неоднозначно",
+    "conflicting": "конфликт",
+    "missing": "нет данных",
+    "inferred": "выведено",
+    "needs_review": "нужна проверка",
+}
+
+INSIGHT_SECTION_LABELS = {
+    "executive_summary": "Краткое резюме",
+    "strengths_weaknesses": "Сильные и слабые стороны",
+    "competitive_advantages": "Конкурентные преимущества",
+    "gaps": "Пробелы",
+    "recommendations": "Рекомендации",
+    "sales_insights": "Выводы для продаж",
+    "ux_insights": "UX-выводы",
+    "product_conclusions": "Продуктовые выводы",
+    "swot": "SWOT",
+    "positioning_analysis": "Позиционирование",
+    "value_proposition_comparison": "Сравнение ценностных предложений",
+    "uncertainty_notes": "Неопределённость",
+    "conflicts": "Конфликты данных",
+}
+
+
 def cells_to_dataframe(cells: Dict[str, Dict[str, object]]) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     for competitor, fields in cells.items():
@@ -14,10 +40,10 @@ def cells_to_dataframe(cells: Dict[str, Dict[str, object]]) -> pd.DataFrame:
         for field, cell in fields.items():
             data = cell.to_dict() if hasattr(cell, "to_dict") else cell
             row[field] = data.get("normalized_value") or data.get("extracted_value") or ""
-            row[f"{field} · status"] = data.get("status", "")
-            row[f"{field} · confidence"] = data.get("confidence_score", 0)
-            row[f"{field} · source"] = data.get("source_url", "")
-            row[f"{field} · fragment"] = data.get("source_fragment", "")
+            row[f"{field} · статус"] = STATUS_LABELS.get(str(data.get("status", "")), data.get("status", ""))
+            row[f"{field} · уверенность"] = data.get("confidence_score", 0)
+            row[f"{field} · источник"] = data.get("source_url", "")
+            row[f"{field} · фрагмент"] = data.get("source_fragment", "")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -29,20 +55,20 @@ def export_csv(df: pd.DataFrame) -> bytes:
 def export_excel(df: pd.DataFrame, insights: Dict[str, object], logs: List[Dict[str, str]], diff: List[Dict[str, object]]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Battle-card")
-        pd.DataFrame(flatten_insights(insights)).to_excel(writer, index=False, sheet_name="Insights")
-        pd.DataFrame(logs).to_excel(writer, index=False, sheet_name="Logs")
-        pd.DataFrame(diff).to_excel(writer, index=False, sheet_name="Diff")
+        df.to_excel(writer, index=False, sheet_name="Таблица")
+        pd.DataFrame(flatten_insights(insights)).to_excel(writer, index=False, sheet_name="Выводы")
+        pd.DataFrame(logs).to_excel(writer, index=False, sheet_name="Логи")
+        pd.DataFrame(diff).to_excel(writer, index=False, sheet_name="Изменения")
     return output.getvalue()
 
 
 def export_markdown(df: pd.DataFrame, insights: Dict[str, object], diff: List[Dict[str, object]]) -> bytes:
-    parts = ["# Competitive research", "", "## Battle-card", df.to_markdown(index=False), "", "## Insights"]
+    parts = ["# Конкурентное исследование", "", "## Сравнительная таблица", df.to_markdown(index=False), "", "## Выводы"]
     for key, value in insights.items():
-        parts.append(f"### {key}")
+        parts.append(f"### {INSIGHT_SECTION_LABELS.get(key, key)}")
         parts.append(json.dumps(value, ensure_ascii=False, indent=2))
     if diff:
-        parts.extend(["", "## Diff", pd.DataFrame(diff).to_markdown(index=False)])
+        parts.extend(["", "## Изменения", pd.DataFrame(diff).to_markdown(index=False)])
     return "\n".join(parts).encode("utf-8")
 
 
@@ -50,8 +76,8 @@ def export_docx(df: pd.DataFrame, insights: Dict[str, object], diff: List[Dict[s
     from docx import Document
 
     document = Document()
-    document.add_heading("Competitive research", 0)
-    document.add_heading("Battle-card", level=1)
+    document.add_heading("Конкурентное исследование", 0)
+    document.add_heading("Сравнительная таблица", level=1)
     table = document.add_table(rows=1, cols=len(df.columns))
     for index, column in enumerate(df.columns):
         table.rows[0].cells[index].text = str(column)
@@ -59,12 +85,12 @@ def export_docx(df: pd.DataFrame, insights: Dict[str, object], diff: List[Dict[s
         cells = table.add_row().cells
         for index, column in enumerate(df.columns):
             cells[index].text = str(row[column])
-    document.add_heading("Insights", level=1)
+    document.add_heading("Выводы", level=1)
     for key, value in insights.items():
-        document.add_heading(key, level=2)
+        document.add_heading(INSIGHT_SECTION_LABELS.get(key, key), level=2)
         document.add_paragraph(json.dumps(value, ensure_ascii=False, indent=2))
     if diff:
-        document.add_heading("Diff", level=1)
+        document.add_heading("Изменения", level=1)
         document.add_paragraph(json.dumps(diff, ensure_ascii=False, indent=2))
     output = io.BytesIO()
     document.save(output)
@@ -98,5 +124,5 @@ def google_sheets_payload(df: pd.DataFrame) -> str:
 def flatten_insights(insights: Dict[str, object]) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     for key, value in insights.items():
-        rows.append({"section": key, "content": json.dumps(value, ensure_ascii=False)})
+        rows.append({"раздел": INSIGHT_SECTION_LABELS.get(key, key), "содержание": json.dumps(value, ensure_ascii=False)})
     return rows

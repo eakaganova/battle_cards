@@ -15,7 +15,7 @@ TEMPLATES_DIR = DATA_DIR / "templates"
 
 @dataclass(frozen=True)
 class AppConfig:
-    app_name: str = "Competitive AI Research Platform"
+    app_name: str = "AI-платформа конкурентного анализа"
     data_dir: Path = DATA_DIR
     export_dir: Path = EXPORT_DIR
     cache_dir: Path = CACHE_DIR

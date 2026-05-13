@@ -34,7 +34,7 @@ class OpenAICompatibleProvider(LLMProvider):
         params: Dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": "Return valid JSON only. Never fabricate missing facts."},
+                {"role": "system", "content": "Верни только валидный JSON. Не выдумывай факты. Все пользовательские тексты пиши на русском языке."},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
@@ -72,7 +72,7 @@ class HeuristicProvider(LLMProvider):
         return {
             "cells": cells,
             "suggested_new_parameters": suggest_parameters(source_text),
-            "executive_summary": ["LLM не настроена, поэтому создан эвристический анализ с явной низкой уверенностью."],
+            "executive_summary": ["LLM не настроена, поэтому создан эвристический анализ с явно низкой уверенностью."],
         }
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import time
 from dataclasses import asdict
@@ -63,11 +64,25 @@ def fetch_source(
         )
 
     def operation() -> SourceArtifact:
+        static_artifact: Optional[SourceArtifact] = None
+        try:
+            progress("requests", competitor, "Сначала читаю статический HTML: многие банковские страницы уже содержат условия в серверной разметке.")
+            static_artifact = fetch_with_requests(competitor, url, config)
+        except Exception as exc:
+            progress("requests", competitor, f"Статический парсер не справился: {exc}. Продолжаю через браузер.")
+
         try:
             progress("playwright", competitor, "Открываю страницу, жду JS и раскрываю скрытые блоки.")
-            return fetch_with_playwright(competitor, url, config, progress)
+            browser_artifact = fetch_with_playwright(competitor, url, config, progress)
+            if static_artifact:
+                return merge_artifacts(static_artifact, browser_artifact)
+            return browser_artifact
         except Exception as exc:
-            progress("requests", competitor, f"Playwright недоступен или не справился: {exc}. Перехожу на fallback.")
+            progress("requests", competitor, f"Playwright недоступен или не справился: {exc}. Использую статический HTML, если он собран.")
+            if static_artifact:
+                static_artifact.errors.append(f"Playwright не сработал: {exc}")
+                static_artifact.status = "partial_success_static_only"
+                return static_artifact
             return fetch_with_requests(competitor, url, config)
 
     return retry(operation, config.max_retries, lambda message: progress("retry", competitor, message))
@@ -88,6 +103,28 @@ def fetch_with_requests(competitor: str, url: str, config: AppConfig) -> SourceA
     except Exception:
         soup = BeautifulSoup(response.text, "html.parser")
     return artifact_from_soup(competitor, url, response.text, soup, "requests_bs4")
+
+
+def merge_artifacts(static_artifact: SourceArtifact, browser_artifact: SourceArtifact) -> SourceArtifact:
+    merged_text = merge_text_blocks(
+        [
+            "=== СТАТИЧЕСКИЙ HTML ===\n" + static_artifact.raw_text,
+            "=== БРАУЗЕРНЫЙ DOM ===\n" + browser_artifact.raw_text,
+            "=== СКРЫТЫЙ ТЕКСТ ===\n" + browser_artifact.hidden_text,
+            "=== МОДАЛЬНЫЕ ОКНА ===\n" + "\n\n".join(browser_artifact.modal_texts),
+        ]
+    )
+    primary = browser_artifact if len(browser_artifact.raw_text) >= len(static_artifact.raw_text) else static_artifact
+    primary.raw_text = merged_text
+    primary.cleaned_text = clean_text(merged_text)
+    primary.tables = static_artifact.tables + browser_artifact.tables
+    primary.faq_items = static_artifact.faq_items + browser_artifact.faq_items
+    primary.pdf_links = unique_list(static_artifact.pdf_links + browser_artifact.pdf_links)
+    primary.iframe_urls = unique_list(static_artifact.iframe_urls + browser_artifact.iframe_urls)
+    primary.errors = static_artifact.errors + browser_artifact.errors
+    primary.extraction_method = f"{static_artifact.extraction_method}+{browser_artifact.extraction_method}"
+    primary.status = "success_merged_static_and_browser"
+    return primary
 
 
 def fetch_with_playwright(
@@ -203,19 +240,21 @@ def collect_modal_texts(page, progress: ProgressCallback, competitor: str) -> Li
 
 
 def artifact_from_soup(competitor: str, url: str, html: str, soup: BeautifulSoup, method: str) -> SourceArtifact:
-    for node in soup(["script", "style", "noscript"]):
-        node.decompose()
+    embedded_json_text = extract_embedded_json_text(soup)
     faq_items = extract_faq(soup)
     tables = extract_tables(soup)
     pdf_links = extract_document_links(soup, url)
     iframe_urls = [urljoin(url, item.get("src", "")) for item in soup.find_all("iframe") if item.get("src")]
+    for node in soup(["script", "style", "noscript", "svg"]):
+        node.decompose()
     text_parts = [
-        soup.get_text("\n", strip=True),
+        extract_main_content_text(soup),
         format_faq(faq_items),
         format_tables(tables),
         collect_hidden_text(soup),
+        embedded_json_text,
     ]
-    raw_text = "\n\n".join(part for part in text_parts if part)
+    raw_text = merge_text_blocks(text_parts)
     return SourceArtifact(
         competitor=competitor,
         url=url,
@@ -275,6 +314,92 @@ def collect_hidden_text(soup: BeautifulSoup) -> str:
     return "\n".join(texts[:80])
 
 
+def extract_main_content_text(soup: BeautifulSoup) -> str:
+    blocks: List[str] = []
+    selectors = [
+        "main",
+        "[role='main']",
+        "article",
+        "[data-qa*='content']",
+        "[data-test*='content']",
+        "[class*='content']",
+        "[class*='main']",
+    ]
+    for selector in selectors:
+        for node in soup.select(selector)[:20]:
+            text = clean_text(node.get_text("\n", strip=True))
+            if len(text) > 120:
+                blocks.append(text)
+
+    soup_copy = BeautifulSoup(str(soup), "html.parser")
+    for node in soup_copy.select("header, nav, footer, aside, [role='navigation'], [aria-label*='навигац'], [aria-label*='navigation']"):
+        node.decompose()
+    body_text = clean_text(soup_copy.get_text("\n", strip=True))
+    if body_text:
+        blocks.append(body_text)
+    return merge_text_blocks(blocks)
+
+
+def extract_embedded_json_text(soup: BeautifulSoup) -> str:
+    chunks: List[str] = []
+    for script in soup.find_all("script")[:80]:
+        script_type = (script.get("type") or "").lower()
+        script_id = (script.get("id") or "").lower()
+        text = script.string or script.get_text(" ", strip=True)
+        if not text or len(text) < 80:
+            continue
+        if "json" not in script_type and "__next_data__" not in script_id and "window.__" not in text[:200].lower():
+            continue
+        readable = json_to_readable_text(text)
+        if readable:
+            chunks.append(readable)
+    return merge_text_blocks(chunks[:20])
+
+
+def json_to_readable_text(text: str) -> str:
+    try:
+        data = json.loads(text)
+    except Exception:
+        return clean_text(" ".join(re.findall(r'"([^"{}]{4,180})"', text)[:1500]))
+    values: List[str] = []
+    collect_json_strings(data, values)
+    return clean_text("\n".join(values[:1500]))
+
+
+def collect_json_strings(value: object, values: List[str]) -> None:
+    if isinstance(value, str):
+        cleaned = clean_text(value)
+        if len(cleaned) >= 4 and re.search(r"[А-Яа-яA-Za-z]", cleaned):
+            values.append(cleaned)
+    elif isinstance(value, list):
+        for item in value[:200]:
+            collect_json_strings(item, values)
+    elif isinstance(value, dict):
+        for item in list(value.values())[:200]:
+            collect_json_strings(item, values)
+
+
+def merge_text_blocks(blocks: List[str]) -> str:
+    seen = set()
+    result: List[str] = []
+    for block in blocks:
+        for paragraph in re.split(r"\n{2,}", clean_text(block)):
+            normalized = re.sub(r"\W+", "", paragraph.lower())[:220]
+            if len(paragraph) < 3 or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(paragraph)
+    return "\n\n".join(result)
+
+
+def unique_list(values: List[str]) -> List[str]:
+    result: List[str] = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
 def format_faq(items: List[Dict[str, str]]) -> str:
     if not items:
         return ""
@@ -309,6 +434,60 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
             break
         start = max(end - overlap, start + 1)
     return chunks
+
+
+def prioritize_chunks(chunks: List[str], parameters: List[str], research_type: str = "") -> List[str]:
+    if not chunks:
+        return []
+    keywords = relevance_keywords(parameters, research_type)
+    scored = [(chunk_relevance_score(chunk, keywords), index, chunk) for index, chunk in enumerate(chunks)]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    high = [chunk for score, _, chunk in scored if score > 0]
+    low = [chunk for score, _, chunk in scored if score <= 0]
+    return high + low
+
+
+def relevance_keywords(parameters: List[str], research_type: str = "") -> List[str]:
+    base = [
+        "ставка",
+        "процент",
+        "пск",
+        "полная стоимость",
+        "сумма",
+        "срок",
+        "лет",
+        "месяц",
+        "залог",
+        "авто",
+        "автомоб",
+        "заемщик",
+        "заёмщик",
+        "требован",
+        "документ",
+        "комисс",
+        "страхован",
+        "погашен",
+        "налич",
+        "кредит",
+        "тариф",
+        "услов",
+    ]
+    text = " ".join(parameters + [research_type])
+    words = re.findall(r"[A-Za-zА-Яа-я0-9]{4,}", text.lower())
+    return unique_list(base + words)
+
+
+def chunk_relevance_score(chunk: str, keywords: List[str]) -> int:
+    lowered = chunk.lower()
+    score = 0
+    for keyword in keywords:
+        if keyword and keyword in lowered:
+            score += 1
+    if re.search(r"\d[\d\s]*(?:₽|руб|%)", lowered):
+        score += 4
+    if re.search(r"\b(?:пск|ставк|срок|сумм|требован|документ|комисс)", lowered):
+        score += 5
+    return score
 
 
 def artifact_to_cache_value(artifact: SourceArtifact) -> Dict[str, object]:
