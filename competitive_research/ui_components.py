@@ -25,6 +25,9 @@ def inject_workspace_css() -> None:
         .block-container {padding-top: 1.4rem; max-width: 1480px;}
         [data-testid="stMetricValue"] {font-size: 1.4rem;}
         .research-shell {border: 1px solid #e4e7ec; border-radius: 8px; padding: 14px 16px; background: #ffffff;}
+        .runtime-line {display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid #e4e7ec; border-radius: 8px; padding: 10px 12px; background: #ffffff; font-size: 14px;}
+        .runtime-line strong {font-weight: 650;}
+        .runtime-meta {display: flex; gap: 16px; white-space: nowrap; color: #475467;}
         .stage-pill {display: inline-flex; align-items: center; gap: 6px; border: 1px solid #e4e7ec; border-radius: 999px; padding: 4px 10px; margin: 3px; font-size: 12px;}
         .status-dot {width: 8px; height: 8px; border-radius: 50%;}
         .cell-badge {border-radius: 999px; color: white; padding: 2px 8px; font-size: 12px;}

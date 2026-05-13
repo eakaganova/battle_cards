@@ -237,6 +237,7 @@ DEFAULT_TEMPLATE_GROUPS = {
 RESEARCH_TYPES = [
     "Ипотека",
     "КНЗ",
+    "КНА",
     "ОСАГО",
     "SaaS",
     "Fintech",

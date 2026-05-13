@@ -16,22 +16,32 @@ class LLMProvider(ABC):
 
 
 class OpenAICompatibleProvider(LLMProvider):
-    def __init__(self, api_key: str, model: str, base_url: str | None = None, default_headers: Dict[str, str] | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str | None = None,
+        default_headers: Dict[str, str] | None = None,
+        use_response_format: bool = True,
+    ):
         from openai import OpenAI
 
         self.client = OpenAI(api_key=api_key, base_url=base_url, default_headers=default_headers)
         self.model = model
+        self.use_response_format = use_response_format
 
     def complete_json(self, prompt: str) -> Dict[str, Any]:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        params: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": "Return valid JSON only. Never fabricate missing facts."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
+            "temperature": 0.1,
+        }
+        if self.use_response_format:
+            params["response_format"] = {"type": "json_object"}
+        response = self.client.chat.completions.create(**params)
         content = response.choices[0].message.content or "{}"
         return parse_json(content)
 
@@ -72,11 +82,19 @@ def provider_from_config(config: AppConfig) -> LLMProvider:
     if config.llm_provider in {"yandex", "auto"} and config.yandex_api_key and config.yandex_folder:
         return OpenAICompatibleProvider(
             api_key=config.yandex_api_key,
-            model=config.yandex_model,
+            model=yandex_model_uri(config.yandex_folder, config.yandex_model),
             base_url=config.yandex_base_url,
             default_headers={"x-folder-id": config.yandex_folder},
+            use_response_format=False,
         )
     return HeuristicProvider()
+
+
+def yandex_model_uri(folder_id: str, model: str) -> str:
+    model = (model or "").strip()
+    if model.startswith("gpt://"):
+        return model
+    return f"gpt://{folder_id}/{model or 'yandexgpt/latest'}"
 
 
 def parse_json(text: str) -> Dict[str, Any]:

@@ -5,7 +5,7 @@ from typing import Callable, Dict, List, Optional
 
 from .cache import JsonCache
 from .config import AppConfig
-from .llm import cells_from_llm_payload, provider_from_config
+from .llm import HeuristicProvider, cells_from_llm_payload, provider_from_config
 from .models import CompetitorInput, EvidenceCell, ResearchRun, ResearchTemplate, StageStatus
 from .normalization import align_cells_to_schema, detect_conflicts
 from .parser import chunk_text, fetch_source
@@ -22,6 +22,7 @@ class ResearchPipeline:
         self.storage = storage
         self.cache = cache
         self.llm = provider_from_config(config)
+        self.fallback_llm = HeuristicProvider()
 
     def run(
         self,
@@ -95,7 +96,7 @@ class ResearchPipeline:
                 cache_key = f"{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
                 payload = self.cache.get("llm_extraction", cache_key)
                 if payload is None:
-                    payload = self.llm.complete_json(prompt)
+                    payload = self._complete_json_with_fallback(prompt, run, "LLM extraction", artifact.competitor)
                     self.cache.set("llm_extraction", cache_key, payload)
                 raw_cells.extend(cells_from_llm_payload(payload, artifact.url))
                 run.log("INFO", f"Chunk {chunk_index}/{len(chunks)} обработан.", "LLM extraction", artifact.competitor)
@@ -154,10 +155,22 @@ class ResearchPipeline:
             audience,
             detail_level,
         )
-        payload = self.llm.complete_json(prompt)
+        payload = self._complete_json_with_fallback(prompt, run, "Генерация выводов", "")
         if not payload or "executive_summary" not in payload:
             payload = heuristic_insights(compact_table)
         return payload
+
+    def _complete_json_with_fallback(self, prompt: str, run: ResearchRun, stage: str, competitor: str) -> Dict[str, object]:
+        try:
+            return self.llm.complete_json(prompt)
+        except Exception as exc:
+            run.log(
+                "ERROR",
+                f"LLM provider error: {exc}. Pipeline continues with heuristic fallback and low confidence.",
+                stage,
+                competitor,
+            )
+            return self.fallback_llm.complete_json(prompt)
 
     def _stage(self, run: ResearchRun, name: str, message: str, on_event: Optional[UIEvent], progress: float) -> None:
         stage = run.stage(name)
