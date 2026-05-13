@@ -13,6 +13,7 @@ from competitive_research.cache import JsonCache
 from competitive_research.config import AppConfig, ensure_directories
 from competitive_research.exporters import (
     cells_to_dataframe,
+    cells_to_evidence_dataframe,
     export_csv,
     export_docx,
     export_excel,
@@ -22,7 +23,6 @@ from competitive_research.exporters import (
 )
 from competitive_research.models import (
     DEFAULT_TEMPLATE_GROUPS,
-    RESEARCH_TYPES,
     CompetitorInput,
     ResearchRun,
     ResearchTemplate,
@@ -180,11 +180,12 @@ def competitor_editor() -> List[CompetitorInput]:
 def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
     st.subheader("Экспорт")
     df = cells_to_dataframe(run.cells)
+    evidence_df = cells_to_evidence_dataframe(run.cells)
     col1, col2, col3 = st.columns(3)
     col1.download_button("CSV", export_csv(df), "battle_card.csv", "text/csv", use_container_width=True)
     col2.download_button(
         "Excel",
-        export_excel(df, run.insights, run.logs, diff),
+        export_excel(df, run.insights, run.logs, diff, evidence_df=evidence_df),
         "battle_card.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
@@ -207,6 +208,13 @@ def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
         use_container_width=True,
     )
     with st.expander("JSON source of truth", expanded=False):
+        st.download_button(
+            "CSV с источниками и статусами",
+            export_csv(evidence_df),
+            "battle_card_sources.csv",
+            "text/csv",
+            use_container_width=True,
+        )
         st.download_button(
             "JSON исследования",
             json.dumps(run.to_dict(), ensure_ascii=False, indent=2).encode("utf-8"),
@@ -238,7 +246,6 @@ with st.sidebar:
         on_change=apply_selected_preset,
     )
     title = st.text_input("Название исследования", value="Конкурентная таблица")
-    research_type = st.selectbox("Тип исследования", RESEARCH_TYPES, index=1)
     audience = st.selectbox("Аудитория выводов", ["Руководство", "Продукт", "Продажи", "Маркетинг", "Риски / комплаенс"], index=0)
     detail_level = st.select_slider("Детализация", options=["Short", "Balanced", "Deep"], value="Balanced")
     rerun_from_stage = st.selectbox(
@@ -259,9 +266,11 @@ with st.sidebar:
     provider_label = "OpenAI" if CONFIG.openai_api_key else "Yandex" if CONFIG.yandex_api_key else "Эвристический режим без LLM"
     st.caption(f"LLM provider: {provider_label}")
 
+research_type = preset_research_type(st.session_state.active_preset) if st.session_state.active_preset != "Свой список" else "Свой список"
+
 default_template = ResearchTemplate(
-    name=st.session_state.active_preset if st.session_state.active_preset != "Свой список" else f"Шаблон: {research_type}",
-    research_type=preset_research_type(st.session_state.active_preset) if st.session_state.active_preset != "Свой список" else research_type,
+    name=st.session_state.active_preset if st.session_state.active_preset != "Свой список" else "Свой шаблон",
+    research_type=research_type,
     groups=preset_groups(st.session_state.active_preset) if st.session_state.active_preset != "Свой список" else DEFAULT_TEMPLATE_GROUPS,
     audience=audience,
     detail_level=detail_level,
