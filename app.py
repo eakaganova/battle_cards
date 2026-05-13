@@ -40,7 +40,7 @@ from competitive_research.ui_components import (
 
 
 st.set_page_config(
-    page_title="Competitive AI Research",
+    page_title="AI конкурентный анализ",
     page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -64,12 +64,13 @@ def init_state() -> None:
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
         ],
-        "active_preset": "Custom / manual setup",
-        "active_template_groups": DEFAULT_TEMPLATE_GROUPS,
+        "active_preset": "Свой список",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    if "preset_selector" not in st.session_state:
+        st.session_state.preset_selector = st.session_state.active_preset
 
 
 def extract_uploaded_text(files) -> str:
@@ -139,11 +140,11 @@ def render_compact_runtime_status() -> None:
 
 
 def competitor_editor() -> List[CompetitorInput]:
-    st.markdown("#### Competitors and fallback sources")
+    st.markdown("#### Конкуренты и резервные источники")
     competitors: List[CompetitorInput] = []
     rows = st.session_state.competitors
     for index, row in enumerate(rows):
-        with st.expander(f"Competitor {index + 1}", expanded=index < 3):
+        with st.expander(f"Конкурент {index + 1}", expanded=index < 3):
             col1, col2 = st.columns([0.8, 1.4])
             row["name"] = col1.text_input("Название", value=row.get("name", ""), key=f"name_{index}")
             row["url"] = col2.text_input("URL", value=row.get("url", ""), key=f"url_{index}")
@@ -154,7 +155,7 @@ def competitor_editor() -> List[CompetitorInput]:
                 key=f"manual_{index}",
             )
             uploaded_files = st.file_uploader(
-                "PDF / HTML / DOCX / TXT fallback",
+                "PDF / HTML / DOCX / TXT как резервный источник",
                 type=["pdf", "html", "htm", "docx", "txt", "md", "csv"],
                 accept_multiple_files=True,
                 key=f"files_{index}",
@@ -177,7 +178,7 @@ def competitor_editor() -> List[CompetitorInput]:
 
 
 def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
-    st.subheader("Export system")
+    st.subheader("Экспорт")
     df = cells_to_dataframe(run.cells)
     col1, col2, col3 = st.columns(3)
     col1.download_button("CSV", export_csv(df), "battle_card.csv", "text/csv", use_container_width=True)
@@ -199,7 +200,7 @@ def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
     )
     col5.download_button("PDF", export_pdf(df, run.insights, diff), "battle_card.pdf", "application/pdf", use_container_width=True)
     col6.download_button(
-        "Google Sheets CSV payload",
+        "CSV для Google Sheets",
         google_sheets_payload(df).encode("utf-8-sig"),
         "google_sheets_import.csv",
         "text/csv",
@@ -207,35 +208,38 @@ def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
     )
     with st.expander("JSON source of truth", expanded=False):
         st.download_button(
-            "Research JSON",
+            "JSON исследования",
             json.dumps(run.to_dict(), ensure_ascii=False, indent=2).encode("utf-8"),
             f"{run.run_id}.json",
             "application/json",
         )
 
 
+def apply_selected_preset() -> None:
+    selected = st.session_state.get("preset_selector", "Свой список")
+    st.session_state.active_preset = selected
+    if selected != "Свой список":
+        st.session_state.competitors = preset_competitors(selected)
+        st.session_state.current_message = f"Пресет выбран: {selected}"
+
+
 init_state()
 
-st.title("Competitive AI Research Platform")
-st.caption("Evidence-first battle-cards with visible pipeline, parser diagnostics, LLM extraction, review, versioning and exports.")
+st.title("AI-платформа конкурентного анализа")
+st.caption("Сравнительные таблицы с источниками, уверенностью, LLM-анализом, проверкой данных, версиями и экспортом.")
 
 with st.sidebar:
-    st.header("Research setup")
-    preset_options = ["Custom / manual setup"] + preset_names()
-    active_preset_index = preset_options.index(st.session_state.active_preset) if st.session_state.active_preset in preset_options else 0
-    selected_preset = st.selectbox("Готовый банковский пресет", preset_options, index=active_preset_index)
-    if st.button("Загрузить пресет", use_container_width=True):
-        st.session_state.active_preset = selected_preset
-        if selected_preset != "Custom / manual setup":
-            st.session_state.competitors = preset_competitors(selected_preset)
-            st.session_state.active_template_groups = preset_groups(selected_preset)
-            st.session_state.current_message = f"Загружен пресет: {selected_preset}"
-            st.rerun()
-        st.session_state.active_template_groups = DEFAULT_TEMPLATE_GROUPS
-        st.rerun()
-    title = st.text_input("Название исследования", value="Competitive battle-card")
+    st.header("Настройка исследования")
+    preset_options = ["Свой список"] + preset_names()
+    st.selectbox(
+        "Готовый банковский пресет",
+        preset_options,
+        key="preset_selector",
+        on_change=apply_selected_preset,
+    )
+    title = st.text_input("Название исследования", value="Конкурентная таблица")
     research_type = st.selectbox("Тип исследования", RESEARCH_TYPES, index=1)
-    audience = st.selectbox("Аудитория выводов", ["Executive", "Product", "Sales", "Marketing", "Risk / Compliance"], index=0)
+    audience = st.selectbox("Аудитория выводов", ["Руководство", "Продукт", "Продажи", "Маркетинг", "Риски / комплаенс"], index=0)
     detail_level = st.select_slider("Детализация", options=["Short", "Balanced", "Deep"], value="Balanced")
     rerun_from_stage = st.selectbox(
         "Перезапуск с этапа",
@@ -252,13 +256,13 @@ with st.sidebar:
     previous_options = ["Нет"] + [f"{item['run_id']} · {item['title']} · {item['updated_at']}" for item in previous_runs]
     previous_choice = st.selectbox("Сравнить с прошлой версией", previous_options)
     st.divider()
-    provider_label = "OpenAI" if CONFIG.openai_api_key else "Yandex" if CONFIG.yandex_api_key else "Offline heuristic fallback"
+    provider_label = "OpenAI" if CONFIG.openai_api_key else "Yandex" if CONFIG.yandex_api_key else "Эвристический режим без LLM"
     st.caption(f"LLM provider: {provider_label}")
 
 default_template = ResearchTemplate(
-    name=st.session_state.active_preset if st.session_state.active_preset != "Custom / manual setup" else f"{research_type} template",
-    research_type=preset_research_type(st.session_state.active_preset) if st.session_state.active_preset != "Custom / manual setup" else research_type,
-    groups=st.session_state.active_template_groups,
+    name=st.session_state.active_preset if st.session_state.active_preset != "Свой список" else f"Шаблон: {research_type}",
+    research_type=preset_research_type(st.session_state.active_preset) if st.session_state.active_preset != "Свой список" else research_type,
+    groups=preset_groups(st.session_state.active_preset) if st.session_state.active_preset != "Свой список" else DEFAULT_TEMPLATE_GROUPS,
     audience=audience,
     detail_level=detail_level,
 )
@@ -268,7 +272,7 @@ left, right = st.columns([0.38, 0.62], gap="large")
 with left:
     template = template_editor(default_template)
     competitors = competitor_editor()
-    run_button = st.button("Запустить research pipeline", type="primary", use_container_width=True)
+    run_button = st.button("Запустить исследование", type="primary", use_container_width=True)
 
 with right:
     context_cols = st.columns(3)
@@ -286,7 +290,7 @@ with right:
 if run_button:
     st.session_state.run_started_at = time.time()
     st.session_state.current_progress = 0.0
-    st.session_state.current_message = "Запуск pipeline"
+    st.session_state.current_message = "Запуск исследования"
     previous_data = None
     if previous_choice != "Нет":
         previous_run_id = previous_choice.split(" · ", 1)[0]
@@ -312,11 +316,11 @@ run = st.session_state.current_run
 if run:
     st.divider()
     current_df = cells_to_dataframe(run.cells)
-    st.subheader("Battle-card")
+    st.subheader("Сравнительная таблица")
     st.dataframe(current_df, use_container_width=True, hide_index=True)
 
     edited_cells = render_review_table(run)
-    with st.expander("Edited review JSON", expanded=False):
+    with st.expander("JSON правок", expanded=False):
         st.json(edited_cells, expanded=False)
 
     render_insights(run.insights)
@@ -326,20 +330,20 @@ if run:
         previous_run_id = previous_choice.split(" · ", 1)[0]
         previous_data = STORAGE.load_run(previous_run_id)
     diff = diff_runs(previous_data or {}, run.to_dict()) if previous_data else []
-    st.subheader("Versioning and change tracking")
+    st.subheader("Версии и изменения")
     if diff:
         st.dataframe(pd.DataFrame(diff), use_container_width=True, hide_index=True)
     else:
         st.caption("Diff появится после выбора предыдущего исследования.")
     render_exports(run, diff)
 
-with st.expander("Architecture notes", expanded=False):
+with st.expander("Архитектурные заметки", expanded=False):
     st.markdown(
         """
-        - Parser, extraction, normalization, UI, storage and export live in separate modules.
-        - Every table cell is JSON-first evidence: raw value, normalized value, source, fragment, confidence, method, timestamp and status.
-        - LLM is behind a provider abstraction. With no API key the app still runs in low-confidence heuristic mode.
-        - Saved runs are immutable JSON versions under `data/runs`; diff highlights added, removed and critical changed values.
-        - The UI never hides uncertainty: missing, ambiguous, conflicting and needs_review are first-class statuses.
+        - Парсер, извлечение, нормализация, интерфейс, хранение и экспорт разделены по модулям.
+        - Каждая ячейка хранится как JSON-доказательство: исходное значение, нормализованное значение, источник, фрагмент, уверенность, метод, время и статус.
+        - LLM подключена через слой провайдеров. Если ключ не задан, приложение работает в эвристическом режиме с низкой уверенностью.
+        - Исследования сохраняются как JSON-версии в `data/runs`; сравнение версий показывает добавленные, удалённые и критично изменённые значения.
+        - Интерфейс не скрывает неопределённость: отсутствие данных, неоднозначность, конфликт и необходимость проверки показываются явно.
         """
     )
