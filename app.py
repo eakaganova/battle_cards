@@ -197,12 +197,18 @@ def set_competitors_from_preset(preset_name: str) -> None:
     reset_competitor_widget_state()
 
 
-def ensure_preset_competitors_loaded() -> None:
-    preset_name = st.session_state.active_preset
-    if preset_name == "Свой список":
+def sync_selected_preset(selected_preset: str) -> None:
+    if selected_preset == st.session_state.active_preset and st.session_state.last_synced_preset == selected_preset:
         return
-    if st.session_state.last_synced_preset != preset_name:
-        set_competitors_from_preset(preset_name)
+    st.session_state.active_preset = selected_preset
+    if selected_preset == "Свой список":
+        st.session_state.last_synced_preset = selected_preset
+        reset_competitor_widget_state()
+        st.rerun()
+        return
+    set_competitors_from_preset(selected_preset)
+    st.session_state.current_message = f"Пресет выбран: {selected_preset}"
+    st.rerun()
 
 
 def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
@@ -251,14 +257,6 @@ def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
         )
 
 
-def apply_selected_preset() -> None:
-    selected = st.session_state.get("preset_selector", "Свой список")
-    st.session_state.active_preset = selected
-    if selected != "Свой список":
-        set_competitors_from_preset(selected)
-        st.session_state.current_message = f"Пресет выбран: {selected}"
-
-
 init_state()
 
 st.title("AI-платформа конкурентного анализа")
@@ -267,14 +265,13 @@ st.caption("Сравнительные таблицы с источниками,
 with st.sidebar:
     st.header("Настройка исследования")
     preset_options = ["Свой список"] + preset_names()
-    st.selectbox(
+    selected_preset = st.selectbox(
         "Готовый банковский пресет",
         preset_options,
         key="preset_selector",
-        on_change=apply_selected_preset,
     )
+    sync_selected_preset(selected_preset)
     title = st.text_input("Название исследования", value="Конкурентная таблица")
-    audience = st.selectbox("Аудитория выводов", ["Руководство", "Продукт", "Продажи", "Маркетинг", "Риски / комплаенс"], index=0)
     detail_level = st.select_slider("Детализация", options=["Short", "Balanced", "Deep"], value="Balanced")
     rerun_from_stage = st.selectbox(
         "Перезапуск с этапа",
@@ -300,7 +297,6 @@ default_template = ResearchTemplate(
     name=st.session_state.active_preset if st.session_state.active_preset != "Свой список" else "Свой шаблон",
     research_type=research_type,
     groups=preset_groups(st.session_state.active_preset) if st.session_state.active_preset != "Свой список" else DEFAULT_TEMPLATE_GROUPS,
-    audience=audience,
     detail_level=detail_level,
 )
 
@@ -308,7 +304,6 @@ left, right = st.columns([0.38, 0.62], gap="large")
 
 with left:
     template = template_editor(default_template)
-    ensure_preset_competitors_loaded()
     competitors = competitor_editor()
     run_button = st.button("Запустить исследование", type="primary", use_container_width=True)
 
@@ -340,7 +335,6 @@ if run_button:
         research_type=research_type,
         competitors=competitors,
         template=template,
-        audience=audience,
         detail_level=detail_level,
         rerun_from_stage=None if rerun_from_stage == "Полный запуск" else rerun_from_stage,
         previous_run=previous_data,
