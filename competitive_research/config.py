@@ -30,6 +30,7 @@ class AppConfig:
     max_source_chars: int = int(os.getenv("MAX_SOURCE_CHARS", "120000"))
     chunk_size: int = int(os.getenv("CHUNK_SIZE", "12000"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "800"))
+    max_llm_chunks_per_competitor: int = int(os.getenv("MAX_LLM_CHUNKS_PER_COMPETITOR", "3"))
     max_retries: int = int(os.getenv("MAX_RETRIES", "3"))
     llm_provider: str = os.getenv("LLM_PROVIDER", "auto")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")

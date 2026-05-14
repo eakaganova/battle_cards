@@ -19,13 +19,34 @@ ProgressCallback = Callable[[str, str, str], None]
 
 
 EXPAND_TEXT_RE = re.compile(
-    r"показать|ещ[её]|подробнее|раскрыть|читать|more|show|expand|details|faq|условия",
+    r"показать|ещ[её]|подробнее|раскрыть|читать|more|show|expand|details|faq|условия|кто|как|какие|какой|можно|нужно|почему|что|где|когда|сколько",
     re.I,
 )
 
+ACCORDION_SELECTOR = (
+    "button, a, [role='button'], summary, [aria-expanded='false'], "
+    "[data-qa-type*='accordion'], "
+    "[class*='accordion-title'], "
+    "[class*='accordion'][role='button'], "
+    "[class*='Accordion'][role='button']"
+)
+
 TAB_TEXT_RE = re.compile(
-    r"тариф|услов|документ|погашен|вопрос|ответ|требован|ставк|пск|комисс|страх|оформ|получ|faq|documents|tariff|terms",
+    r"тариф|услов|документ|погашен|вопрос|ответ|требован|ставк|пск|комисс|страх|оформ|получ|залог|выгод|максимум|faq|documents|tariff|terms",
     re.I,
+)
+
+TAB_SELECTOR = (
+    '[role="tab"], '
+    'button[data-qa-type*="segmented-item"], '
+    '[data-qa-type*="segmented-item"], '
+    'button[aria-selected], '
+    '[role="tablist"] button, '
+    'li[class*="TabTitle"], '
+    'li[class*="tabs-header"], '
+    'ul[class*="TabTitleContainer"] > li, '
+    '[class*="TabTitleHorizontal"], '
+    '[class*="TabTitleSelector"]'
 )
 
 
@@ -161,9 +182,10 @@ def fetch_with_playwright(
             if budget_exhausted(started_at, config.browser_interaction_budget_seconds):
                 progress("dynamic", competitor, "Бюджет браузерной проверки исчерпан, перехожу к извлечению текущего DOM.")
                 clicked = 0
+                accordion_texts = []
                 tab_texts = []
             else:
-                clicked = click_expandable(page, progress, competitor, config.accordion_budget_seconds)
+                clicked, accordion_texts = click_expandable(page, progress, competitor, config.accordion_budget_seconds)
                 remaining_budget = max(2.0, config.browser_interaction_budget_seconds - (time.monotonic() - started_at))
                 tab_texts = click_tabs_and_collect_text(page, progress, competitor, min(config.tabs_budget_seconds, remaining_budget))
             modal_texts = collect_modal_texts(page, progress, competitor)
@@ -173,10 +195,16 @@ def fetch_with_playwright(
             except Exception:
                 soup = BeautifulSoup(html, "html.parser")
             artifact = artifact_from_soup(competitor, url, html, soup, "playwright_deep")
-            artifact.modal_texts = modal_texts + tab_texts
+            artifact.modal_texts = modal_texts + tab_texts + accordion_texts
             artifact.hidden_text = collect_hidden_text(soup)
-            if clicked or tab_texts:
-                artifact.raw_text = merge_text_blocks([artifact.raw_text, "=== ТЕКСТ ИЗ ВКЛАДОК ===\n" + "\n\n".join(tab_texts)])
+            if clicked or tab_texts or accordion_texts:
+                artifact.raw_text = merge_text_blocks(
+                    [
+                        artifact.raw_text,
+                        "=== ТЕКСТ ИЗ РАСКРЫТЫХ FAQ/ACCORDION ===\n" + "\n\n".join(accordion_texts),
+                        "=== ТЕКСТ ИЗ ВКЛАДОК ===\n" + "\n\n".join(tab_texts),
+                    ]
+                )
                 artifact.cleaned_text = clean_text(artifact.raw_text)
                 artifact.status = f"success_expanded_{clicked}_controls_{len(tab_texts)}_tabs"
             return artifact
@@ -219,10 +247,13 @@ def scroll_deep(page, progress: ProgressCallback, competitor: str) -> None:
     progress("dynamic", competitor, f"Прокрутка завершена, раундов: {rounds}.")
 
 
-def click_expandable(page, progress: ProgressCallback, competitor: str, budget_seconds: float = 6.0) -> int:
+def click_expandable(page, progress: ProgressCallback, competitor: str, budget_seconds: float = 6.0) -> tuple[int, List[str]]:
     started_at = time.monotonic()
+    collected: List[str] = []
+    dom_collected, dom_clicked, dom_labels = click_accordions_with_dom_api(page, budget_seconds)
+    collected.extend(dom_collected)
     clicked = 0
-    candidates = page.locator("button, a, [role='button'], summary, [aria-expanded='false'], [data-qa-type*='accordion']")
+    candidates = page.locator(ACCORDION_SELECTOR)
     count = min(candidates.count(), 60)
     for index in range(count):
         if budget_exhausted(started_at, budget_seconds):
@@ -238,10 +269,82 @@ def click_expandable(page, progress: ProgressCallback, competitor: str, budget_s
             if page.url != before_url:
                 page.go_back(wait_until="domcontentloaded", timeout=2500)
             clicked += 1
+            text = collect_current_main_text(page)
+            if text:
+                collected.append(f"Раскрытый блок: {label}\n{text}")
         except Exception:
             continue
-    progress("accordion", competitor, f"Раскрыто accordion/show-more элементов: {clicked}.")
-    return clicked
+    total_clicked = clicked + dom_clicked
+    labels_preview = ", ".join(unique_list(dom_labels)[:8])
+    suffix = f" Найдено кандидатов: {len(unique_list(dom_labels))}. Кандидаты: {labels_preview}" if labels_preview else ""
+    progress("accordion", competitor, f"Раскрыто FAQ/accordion/show-more элементов: {total_clicked}.{suffix}")
+    return total_clicked, collected
+
+
+def click_accordions_with_dom_api(page, budget_seconds: float = 6.0) -> tuple[List[str], int, List[str]]:
+    started_at = time.monotonic()
+    collected: List[str] = []
+    labels: List[str] = []
+    clicked = 0
+    for frame in page.frames:
+        try:
+            candidates = frame.evaluate(
+                """
+                (selector) => Array.from(document.querySelectorAll(selector)).map((el, index) => ({
+                    index,
+                    text: (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim(),
+                    expanded: el.getAttribute('aria-expanded') || '',
+                    role: el.getAttribute('role') || '',
+                    className: el.className || ''
+                }))
+                """,
+                ACCORDION_SELECTOR,
+            )
+        except Exception:
+            continue
+        for candidate in candidates[:80]:
+            if budget_exhausted(started_at, budget_seconds):
+                return collected, clicked, labels
+            label = clean_text(str(candidate.get("text", "")))
+            if not label:
+                continue
+            labels.append(label)
+            if not is_expandable_label(label, str(candidate.get("className", ""))):
+                continue
+            try:
+                frame.evaluate(
+                    """
+                    (payload) => {
+                        const items = Array.from(document.querySelectorAll(payload.selector));
+                        const el = items[payload.index];
+                        if (!el) return false;
+                        el.scrollIntoView({block: 'center', inline: 'center'});
+                        el.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true}));
+                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+                        el.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true}));
+                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+                        el.click();
+                        return true;
+                    }
+                    """,
+                    {"index": candidate["index"], "selector": ACCORDION_SELECTOR},
+                )
+                page.wait_for_timeout(280)
+                text = collect_frame_main_text(frame)
+                if text:
+                    collected.append(f"Раскрытый блок: {label}\n{text}")
+                clicked += 1
+            except Exception:
+                continue
+    return collected, clicked, labels
+
+
+def is_expandable_label(label: str, class_name: str = "") -> bool:
+    if EXPAND_TEXT_RE.search(label):
+        return True
+    if "accordion" in class_name.lower():
+        return True
+    return "?" in label and len(label) <= 220
 
 
 def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: str, budget_seconds: float = 7.0) -> List[str]:
@@ -256,14 +359,18 @@ def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: st
         "[data-qa-type*='segmented-item']",
         "button[aria-selected]",
         "[role='tablist'] button",
+        "li[class*='TabTitle']",
+        "li[class*='tabs-header']",
+        "ul[class*='TabTitleContainer'] > li",
+        "[class*='TabTitleHorizontal']",
     ]
     seen_labels = set()
     clicked = js_clicked
     if budget_exhausted(started_at, budget_seconds):
-        labels_preview = ", ".join(js_labels[:8])
-        suffix = f" Найдены кандидаты: {labels_preview}" if labels_preview else ""
-        progress("tabs", competitor, f"Открыто вкладок/переключателей: {clicked}.{suffix}")
-        return collected
+                labels_preview = ", ".join(unique_list(js_labels)[:8])
+                suffix = f" Найдено вкладок: {len(unique_list(js_labels))}. Кандидаты: {labels_preview}" if labels_preview else ""
+                progress("tabs", competitor, f"Открыто вкладок/переключателей: {clicked}.{suffix}")
+                return collected
     for selector in selectors:
         try:
             candidates = page.locator(selector)
@@ -294,8 +401,8 @@ def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: st
                 clicked += 1
             except Exception:
                 continue
-    labels_preview = ", ".join(js_labels[:8])
-    suffix = f" Найдены кандидаты: {labels_preview}" if labels_preview else ""
+    labels_preview = ", ".join(unique_list(js_labels)[:8])
+    suffix = f" Найдено вкладок: {len(unique_list(js_labels))}. Кандидаты: {labels_preview}" if labels_preview else ""
     progress("tabs", competitor, f"Открыто вкладок/переключателей: {clicked}.{suffix}")
     return collected
 
@@ -309,16 +416,15 @@ def click_tabs_with_dom_api(page, budget_seconds: float = 7.0) -> tuple[List[str
         try:
             candidates = frame.evaluate(
                 """
-                () => Array.from(document.querySelectorAll(
-                    '[role="tab"], button[data-qa-type*="segmented-item"], [data-qa-type*="segmented-item"], button[aria-selected], [role="tablist"] button'
-                )).map((el, index) => ({
+                (selector) => Array.from(document.querySelectorAll(selector)).map((el, index) => ({
                     index,
                     text: (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim(),
                     qa: el.getAttribute('data-qa-type') || '',
                     selected: el.getAttribute('aria-selected') || '',
                     active: el.getAttribute('data-active') || ''
                 }))
-                """
+                """,
+                TAB_SELECTOR,
             )
         except Exception:
             continue
@@ -335,11 +441,9 @@ def click_tabs_with_dom_api(page, budget_seconds: float = 7.0) -> tuple[List[str
                 before_url = page.url
                 frame.evaluate(
                     """
-                    (targetIndex) => {
-                        const items = Array.from(document.querySelectorAll(
-                            '[role="tab"], button[data-qa-type*="segmented-item"], [data-qa-type*="segmented-item"], button[aria-selected], [role="tablist"] button'
-                        ));
-                        const el = items[targetIndex];
+                    (payload) => {
+                        const items = Array.from(document.querySelectorAll(payload.selector));
+                        const el = items[payload.index];
                         if (!el) return false;
                         el.scrollIntoView({block: 'center', inline: 'center'});
                         el.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true}));
@@ -350,7 +454,7 @@ def click_tabs_with_dom_api(page, budget_seconds: float = 7.0) -> tuple[List[str
                         return true;
                     }
                     """,
-                    candidate["index"],
+                    {"index": candidate["index"], "selector": TAB_SELECTOR},
                 )
                 page.wait_for_timeout(350)
                 if page.url != before_url:
@@ -613,6 +717,73 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def prepare_text_for_llm(text: str) -> str:
+    cleaned = clean_text(text)
+    cleaned = remove_repeated_short_lines(cleaned)
+    cleaned = deduplicate_paragraphs(cleaned)
+    return clean_text(cleaned)
+
+
+def remove_repeated_short_lines(text: str) -> str:
+    lines: List[str] = []
+    seen_counts: Dict[str, int] = {}
+    for line in text.splitlines():
+        line = clean_text(line)
+        if not line:
+            lines.append("")
+            continue
+        normalized = normalize_for_dedupe(line)
+        if len(normalized) < 8:
+            continue
+        seen_counts[normalized] = seen_counts.get(normalized, 0) + 1
+        if len(line) <= 120 and seen_counts[normalized] > 2:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def deduplicate_paragraphs(text: str) -> str:
+    paragraphs = re.split(r"\n{2,}", text)
+    result: List[str] = []
+    seen = set()
+    long_fingerprints: List[str] = []
+    for paragraph in paragraphs:
+        paragraph = clean_text(paragraph)
+        if not paragraph:
+            continue
+        normalized = normalize_for_dedupe(paragraph)
+        if len(normalized) < 20:
+            result.append(paragraph)
+            continue
+        fingerprint = normalized[:240]
+        if fingerprint in seen:
+            continue
+        if is_near_duplicate(normalized, long_fingerprints):
+            continue
+        seen.add(fingerprint)
+        if len(normalized) >= 160:
+            long_fingerprints.append(fingerprint)
+            long_fingerprints = long_fingerprints[-700:]
+        result.append(paragraph)
+    return "\n\n".join(result)
+
+
+def is_near_duplicate(normalized: str, fingerprints: List[str]) -> bool:
+    if len(normalized) < 160:
+        return False
+    head = normalized[:180]
+    for fingerprint in fingerprints:
+        if head in fingerprint or fingerprint[:180] in normalized:
+            return True
+    return False
+
+
+def normalize_for_dedupe(text: str) -> str:
+    lowered = text.lower().replace("ё", "е")
+    lowered = re.sub(r"[^0-9a-zа-я]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
 def looks_like_mojibake(text: str) -> bool:
     if not text:
         return False
@@ -686,6 +857,24 @@ def prioritize_chunks(chunks: List[str], parameters: List[str], research_type: s
     high = [chunk for score, _, chunk in scored if score > 0]
     low = [chunk for score, _, chunk in scored if score <= 0]
     return high + low
+
+
+def select_focused_chunks(
+    chunks: List[str],
+    parameters: List[str],
+    research_type: str = "",
+    max_chunks: int = 3,
+) -> List[str]:
+    if not chunks:
+        return []
+    max_chunks = max(1, max_chunks)
+    keywords = relevance_keywords(parameters, research_type)
+    scored = [(chunk_relevance_score(chunk, keywords), index, chunk) for index, chunk in enumerate(chunks)]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    relevant = [item for item in scored if item[0] > 0]
+    selected = relevant[:max_chunks] if relevant else scored[:max_chunks]
+    selected.sort(key=lambda item: item[1])
+    return [chunk for _, _, chunk in selected]
 
 
 def relevance_keywords(parameters: List[str], research_type: str = "") -> List[str]:

@@ -8,7 +8,7 @@ from .config import AppConfig
 from .llm import HeuristicProvider, cells_from_llm_payload, provider_from_config
 from .models import CompetitorInput, EvidenceCell, ResearchRun, ResearchTemplate, StageStatus
 from .normalization import align_cells_to_schema, detect_conflicts
-from .parser import chunk_text, fetch_source, prioritize_chunks
+from .parser import chunk_text, fetch_source, prepare_text_for_llm, select_focused_chunks
 from .prompts import EXTRACTION_PROMPT_VERSION, build_analytics_prompt, build_extraction_prompt
 from .storage import ResearchStorage, new_run_id
 
@@ -75,28 +75,50 @@ class ResearchPipeline:
 
         self._stage(run, "Очистка текста", "Очищаю текст и ограничиваю объём контекста.", on_event, 0.40)
         for artifact in run.artifacts:
-            artifact.cleaned_text = artifact.cleaned_text[: self.config.max_source_chars]
+            before_chars = len(artifact.cleaned_text)
+            artifact.cleaned_text = prepare_text_for_llm(artifact.cleaned_text)[: self.config.max_source_chars]
+            after_chars = len(artifact.cleaned_text)
+            run.log(
+                "INFO",
+                f"Предварительная очистка источника: {before_chars} -> {after_chars} символов.",
+                "Очистка текста",
+                artifact.competitor,
+            )
         run.stage("Очистка текста").finish(StageStatus.SUCCESS, chars=sum(len(item.cleaned_text) for item in artifacts))
 
         self._stage(run, "Chunking", "Разбиваю источники на chunks для контролируемой LLM-обработки.", on_event, 0.45)
-        chunks_by_competitor = {
-            artifact.competitor: prioritize_chunks(
-                chunk_text(artifact.cleaned_text, self.config.chunk_size, self.config.chunk_overlap),
+        chunks_by_competitor: Dict[str, List[str]] = {}
+        source_chunk_counts: Dict[str, int] = {}
+        for artifact in artifacts:
+            source_chunks = chunk_text(artifact.cleaned_text, self.config.chunk_size, self.config.chunk_overlap)
+            focused_chunks = select_focused_chunks(
+                source_chunks,
                 template.parameters,
                 research_type,
+                self.config.max_llm_chunks_per_competitor,
             )
-            for artifact in artifacts
-        }
-        run.stage("Chunking").finish(StageStatus.SUCCESS, chunks=sum(len(chunks) for chunks in chunks_by_competitor.values()))
+            chunks_by_competitor[artifact.competitor] = focused_chunks
+            source_chunk_counts[artifact.competitor] = len(source_chunks)
+            run.log(
+                "INFO",
+                f"Выбрано релевантных chunks для LLM: {len(focused_chunks)} из {len(source_chunks)}.",
+                "Chunking",
+                artifact.competitor,
+            )
+        run.stage("Chunking").finish(
+            StageStatus.SUCCESS,
+            chunks=sum(len(chunks) for chunks in chunks_by_competitor.values()),
+            source_chunks=sum(source_chunk_counts.values()),
+        )
 
         self._stage(run, "LLM extraction", "Извлекаю структурированные факты и evidence.", on_event, 0.50)
         raw_cells_by_competitor: Dict[str, List[EvidenceCell]] = {}
         for artifact in artifacts:
             raw_cells: List[EvidenceCell] = []
             chunks = chunks_by_competitor.get(artifact.competitor, [])
-            for chunk_index, chunk in enumerate(chunks[:8], start=1):
+            for chunk_index, chunk in enumerate(chunks, start=1):
                 prompt = build_extraction_prompt(artifact.competitor, artifact.url, research_type, template.parameters, chunk)
-                cache_key = f"parser_v6_fast_budgets|{EXTRACTION_PROMPT_VERSION}|{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
+                cache_key = f"parser_v10_dedup_focused_chunks|{EXTRACTION_PROMPT_VERSION}|{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
                 payload = self.cache.get("llm_extraction", cache_key)
                 if payload is None:
                     payload = self._complete_json_with_fallback(prompt, run, "LLM extraction", artifact.competitor)
