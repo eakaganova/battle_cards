@@ -106,8 +106,8 @@ def run_event(run: ResearchRun, stage: str, message: str, progress: float) -> No
     status_placeholder.empty()
     with status_placeholder.container():
         render_compact_runtime_status()
-    logs_placeholder.empty()
-    with logs_placeholder.expander("Технические логи", expanded=False):
+    logs_content_placeholder.empty()
+    with logs_content_placeholder.container():
         render_live_logs(run)
 
 
@@ -292,9 +292,10 @@ with right:
     status_placeholder = st.empty()
     with status_placeholder.container():
         render_compact_runtime_status()
-    logs_placeholder = st.container()
-    with logs_placeholder.expander("Технические логи", expanded=False):
-        render_live_logs(st.session_state.current_run)
+    with st.expander("Технические логи", expanded=False):
+        logs_content_placeholder = st.empty()
+        with logs_content_placeholder.container():
+            render_live_logs(st.session_state.current_run)
 
 if run_button:
     st.session_state.run_started_at = time.time()
