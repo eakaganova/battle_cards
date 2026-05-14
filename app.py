@@ -65,7 +65,6 @@ def init_state() -> None:
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
         ],
         "active_preset": "Свой список",
-        "last_synced_preset": "Свой список",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -190,25 +189,40 @@ def reset_competitor_widget_state(max_rows: int = 40) -> None:
                 del st.session_state[key]
 
 
-def set_competitors_from_preset(preset_name: str) -> None:
-    preset_rows = preset_competitors(preset_name)
-    st.session_state.competitors = preset_rows + [empty_competitor_row()]
-    st.session_state.last_synced_preset = preset_name
-    reset_competitor_widget_state()
-
-
 def sync_selected_preset(selected_preset: str) -> None:
-    if selected_preset == st.session_state.active_preset and st.session_state.last_synced_preset == selected_preset:
-        return
     st.session_state.active_preset = selected_preset
-    if selected_preset == "Свой список":
-        st.session_state.last_synced_preset = selected_preset
-        reset_competitor_widget_state()
-        st.rerun()
-        return
-    set_competitors_from_preset(selected_preset)
-    st.session_state.current_message = f"Пресет выбран: {selected_preset}"
+
+
+def add_companies_to_editor(companies: List[Dict[str, str]]) -> None:
+    current_rows = [
+        row
+        for row in st.session_state.competitors
+        if row.get("name", "").strip() or row.get("url", "").strip() or row.get("manual_text", "").strip() or row.get("uploaded_text", "").strip()
+    ]
+    existing = {(row.get("name", "").strip().lower(), row.get("url", "").strip().lower()) for row in current_rows}
+    for company in companies:
+        key = (company.get("name", "").strip().lower(), company.get("url", "").strip().lower())
+        if key not in existing:
+            current_rows.append(company)
+            existing.add(key)
+    current_rows.append(empty_competitor_row())
+    st.session_state.competitors = current_rows
+    reset_competitor_widget_state()
     st.rerun()
+
+
+def render_preset_company_picker(preset_name: str) -> None:
+    if preset_name == "Свой список":
+        return
+    st.markdown("#### Компании из пресета")
+    preset_rows = preset_competitors(preset_name)
+    selected: List[Dict[str, str]] = []
+    for index, company in enumerate(preset_rows):
+        label = f"{company['name']} — {company['url']}"
+        if st.checkbox(label, value=True, key=f"preset_company_{preset_name}_{index}"):
+            selected.append(company)
+    if st.button("Добавить выбранные компании", use_container_width=True):
+        add_companies_to_editor(selected)
 
 
 def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
@@ -271,6 +285,7 @@ with st.sidebar:
         key="preset_selector",
     )
     sync_selected_preset(selected_preset)
+    render_preset_company_picker(selected_preset)
     title = st.text_input("Название исследования", value="Конкурентная таблица")
     detail_level = st.select_slider("Детализация", options=["Short", "Balanced", "Deep"], value="Balanced")
     rerun_from_stage = st.selectbox(
