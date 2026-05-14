@@ -77,7 +77,7 @@ def fetch_source(
             progress("requests", competitor, f"Статический парсер не справился: {exc}. Продолжаю через браузер.")
 
         try:
-            progress("playwright", competitor, "Открываю страницу, жду JS и раскрываю скрытые блоки.")
+            progress("playwright", competitor, "Открываю страницу в браузере и коротко проверяю динамические блоки.")
             browser_artifact = fetch_with_playwright(competitor, url, config, progress)
             if static_artifact:
                 return merge_artifacts(static_artifact, browser_artifact)
@@ -150,15 +150,22 @@ def fetch_with_playwright(
         )
         page = context.new_page()
         try:
+            started_at = time.monotonic()
             page.goto(url, wait_until="domcontentloaded", timeout=config.playwright_timeout_ms)
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("networkidle", timeout=config.playwright_networkidle_timeout_ms)
             except PlaywrightTimeoutError:
-                progress("dynamic", competitor, "Network idle не наступил, продолжаю с уже отрисованным DOM.")
+                progress("dynamic", competitor, "Страница продолжает фоновые загрузки, использую уже отрисованный контент.")
             click_cookie_banners(page)
             scroll_deep(page, progress, competitor)
-            clicked = click_expandable(page, progress, competitor)
-            tab_texts = click_tabs_and_collect_text(page, progress, competitor)
+            if budget_exhausted(started_at, config.browser_interaction_budget_seconds):
+                progress("dynamic", competitor, "Бюджет браузерной проверки исчерпан, перехожу к извлечению текущего DOM.")
+                clicked = 0
+                tab_texts = []
+            else:
+                clicked = click_expandable(page, progress, competitor, config.accordion_budget_seconds)
+                remaining_budget = max(2.0, config.browser_interaction_budget_seconds - (time.monotonic() - started_at))
+                tab_texts = click_tabs_and_collect_text(page, progress, competitor, min(config.tabs_budget_seconds, remaining_budget))
             modal_texts = collect_modal_texts(page, progress, competitor)
             html = page.content()
             try:
@@ -200,40 +207,49 @@ def click_cookie_banners(page) -> int:
 
 def scroll_deep(page, progress: ProgressCallback, competitor: str) -> None:
     previous_height = 0
-    for _ in range(8):
+    rounds = 0
+    for _ in range(5):
         height = page.evaluate("document.body.scrollHeight")
         page.mouse.wheel(0, 1800)
-        page.wait_for_timeout(650)
+        page.wait_for_timeout(350)
+        rounds += 1
         if height == previous_height:
             break
         previous_height = height
-    progress("dynamic", competitor, "Динамический контент досканирован прокруткой.")
+    progress("dynamic", competitor, f"Прокрутка завершена, раундов: {rounds}.")
 
 
-def click_expandable(page, progress: ProgressCallback, competitor: str) -> int:
+def click_expandable(page, progress: ProgressCallback, competitor: str, budget_seconds: float = 6.0) -> int:
+    started_at = time.monotonic()
     clicked = 0
     candidates = page.locator("button, a, [role='button'], summary, [aria-expanded='false'], [data-qa-type*='accordion']")
-    count = min(candidates.count(), 160)
+    count = min(candidates.count(), 60)
     for index in range(count):
+        if budget_exhausted(started_at, budget_seconds):
+            break
         try:
             element = candidates.nth(index)
-            label = " ".join((element.inner_text(timeout=500) or element.get_attribute("aria-label") or "").split())
+            label = " ".join((element.inner_text(timeout=180) or element.get_attribute("aria-label") or "").split())
             if not label or not EXPAND_TEXT_RE.search(label):
                 continue
             before_url = page.url
-            element.click(timeout=900)
-            page.wait_for_timeout(450)
+            element.click(timeout=350)
+            page.wait_for_timeout(220)
             if page.url != before_url:
-                page.go_back(wait_until="domcontentloaded", timeout=5000)
+                page.go_back(wait_until="domcontentloaded", timeout=2500)
             clicked += 1
         except Exception:
             continue
-    progress("accordion", competitor, f"Раскрыто интерактивных элементов: {clicked}.")
+    progress("accordion", competitor, f"Раскрыто accordion/show-more элементов: {clicked}.")
     return clicked
 
 
-def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: str) -> List[str]:
+def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: str, budget_seconds: float = 7.0) -> List[str]:
+    started_at = time.monotonic()
     collected: List[str] = []
+    js_collected, js_clicked, js_labels = click_tabs_with_dom_api(page, budget_seconds)
+    collected.extend(js_collected)
+
     selectors = [
         "[role='tab']",
         "button[data-qa-type*='segmented-item']",
@@ -242,14 +258,21 @@ def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: st
         "[role='tablist'] button",
     ]
     seen_labels = set()
-    clicked = 0
+    clicked = js_clicked
+    if budget_exhausted(started_at, budget_seconds):
+        labels_preview = ", ".join(js_labels[:8])
+        suffix = f" Найдены кандидаты: {labels_preview}" if labels_preview else ""
+        progress("tabs", competitor, f"Открыто вкладок/переключателей: {clicked}.{suffix}")
+        return collected
     for selector in selectors:
         try:
             candidates = page.locator(selector)
-            count = min(candidates.count(), 80)
+            count = min(candidates.count(), 35)
         except Exception:
             continue
         for index in range(count):
+            if budget_exhausted(started_at, budget_seconds):
+                break
             try:
                 element = candidates.nth(index)
                 label = get_interactive_label(element)
@@ -259,15 +282,11 @@ def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: st
                     continue
                 seen_labels.add(label)
                 before_url = page.url
-                element.scroll_into_view_if_needed(timeout=1200)
-                element.click(timeout=1200)
-                page.wait_for_timeout(700)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=2500)
-                except Exception:
-                    pass
+                element.scroll_into_view_if_needed(timeout=450)
+                element.click(timeout=450)
+                page.wait_for_timeout(350)
                 if page.url != before_url:
-                    page.go_back(wait_until="domcontentloaded", timeout=5000)
+                    page.go_back(wait_until="domcontentloaded", timeout=2500)
                     continue
                 text = collect_current_main_text(page)
                 if text:
@@ -275,8 +294,94 @@ def click_tabs_and_collect_text(page, progress: ProgressCallback, competitor: st
                 clicked += 1
             except Exception:
                 continue
-    progress("tabs", competitor, f"Открыто вкладок/переключателей: {clicked}.")
+    labels_preview = ", ".join(js_labels[:8])
+    suffix = f" Найдены кандидаты: {labels_preview}" if labels_preview else ""
+    progress("tabs", competitor, f"Открыто вкладок/переключателей: {clicked}.{suffix}")
     return collected
+
+
+def click_tabs_with_dom_api(page, budget_seconds: float = 7.0) -> tuple[List[str], int, List[str]]:
+    started_at = time.monotonic()
+    collected: List[str] = []
+    labels: List[str] = []
+    clicked = 0
+    for frame in page.frames:
+        try:
+            candidates = frame.evaluate(
+                """
+                () => Array.from(document.querySelectorAll(
+                    '[role="tab"], button[data-qa-type*="segmented-item"], [data-qa-type*="segmented-item"], button[aria-selected], [role="tablist"] button'
+                )).map((el, index) => ({
+                    index,
+                    text: (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim(),
+                    qa: el.getAttribute('data-qa-type') || '',
+                    selected: el.getAttribute('aria-selected') || '',
+                    active: el.getAttribute('data-active') || ''
+                }))
+                """
+            )
+        except Exception:
+            continue
+        for candidate in candidates[:100]:
+            if budget_exhausted(started_at, budget_seconds):
+                return collected, clicked, labels
+            label = clean_text(" ".join([candidate.get("text", ""), candidate.get("qa", "")]))
+            if not label:
+                continue
+            labels.append(label)
+            if not TAB_TEXT_RE.search(label):
+                continue
+            try:
+                before_url = page.url
+                frame.evaluate(
+                    """
+                    (targetIndex) => {
+                        const items = Array.from(document.querySelectorAll(
+                            '[role="tab"], button[data-qa-type*="segmented-item"], [data-qa-type*="segmented-item"], button[aria-selected], [role="tablist"] button'
+                        ));
+                        const el = items[targetIndex];
+                        if (!el) return false;
+                        el.scrollIntoView({block: 'center', inline: 'center'});
+                        el.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true}));
+                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+                        el.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true}));
+                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+                        el.click();
+                        return true;
+                    }
+                    """,
+                    candidate["index"],
+                )
+                page.wait_for_timeout(350)
+                if page.url != before_url:
+                    page.go_back(wait_until="domcontentloaded", timeout=2500)
+                    continue
+                text = collect_frame_main_text(frame)
+                if text:
+                    collected.append(f"Вкладка: {label}\n{text}")
+                clicked += 1
+            except Exception:
+                continue
+    return collected, clicked, labels
+
+
+def budget_exhausted(started_at: float, budget_seconds: float) -> bool:
+    return time.monotonic() - started_at >= budget_seconds
+
+
+def collect_frame_main_text(frame) -> str:
+    try:
+        text = frame.evaluate(
+            """
+            () => {
+                const main = document.querySelector('main,[role="main"],article') || document.body;
+                return main ? main.innerText : '';
+            }
+            """
+        )
+        return clean_text(text)
+    except Exception:
+        return ""
 
 
 def get_interactive_label(element) -> str:

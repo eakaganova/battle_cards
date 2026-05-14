@@ -23,6 +23,10 @@ class AppConfig:
     templates_dir: Path = TEMPLATES_DIR
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "25"))
     playwright_timeout_ms: int = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "45000"))
+    playwright_networkidle_timeout_ms: int = int(os.getenv("PLAYWRIGHT_NETWORKIDLE_TIMEOUT_MS", "6000"))
+    browser_interaction_budget_seconds: float = float(os.getenv("BROWSER_INTERACTION_BUDGET_SECONDS", "22"))
+    accordion_budget_seconds: float = float(os.getenv("ACCORDION_BUDGET_SECONDS", "6"))
+    tabs_budget_seconds: float = float(os.getenv("TABS_BUDGET_SECONDS", "7"))
     max_source_chars: int = int(os.getenv("MAX_SOURCE_CHARS", "120000"))
     chunk_size: int = int(os.getenv("CHUNK_SIZE", "12000"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "800"))

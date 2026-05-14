@@ -97,7 +97,7 @@ class ResearchPipeline:
             chunks = chunks_by_competitor.get(artifact.competitor, [])
             for chunk_index, chunk in enumerate(chunks[:8], start=1):
                 prompt = build_extraction_prompt(artifact.competitor, artifact.url, research_type, template.parameters, chunk)
-                cache_key = f"parser_v4_encoding_tabs|{EXTRACTION_PROMPT_VERSION}|{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
+                cache_key = f"parser_v6_fast_budgets|{EXTRACTION_PROMPT_VERSION}|{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
                 payload = self.cache.get("llm_extraction", cache_key)
                 if payload is None:
                     payload = self._complete_json_with_fallback(prompt, run, "LLM extraction", artifact.competitor)
