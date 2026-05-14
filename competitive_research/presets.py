@@ -49,9 +49,8 @@ PRESET_RESEARCHES: Dict[str, Dict[str, object]] = {
     "КНА: кредит под залог автомобиля": {
         "research_type": "КНА",
         "competitors": [
-            {"name": "Т-Банк", "url": "https://www.tbank.ru/loans/cash-loan/auto/"},
             {"name": "ВТБ", "url": "https://www.vtb.ru/personal/kredit/pod-zalog-avto/"},
-            {"name": "Совкомбанк", "url": "https://sovcombank.ru/credits/cash/pod-zalog-avto-"},
+            {"name": "Т-Банк", "url": "https://www.tbank.ru/loans/cash-loan/auto/"},
         ],
         "groups": {
             "Источник и доверие": [
