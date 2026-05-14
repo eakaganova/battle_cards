@@ -65,6 +65,7 @@ def init_state() -> None:
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
         ],
         "active_preset": "Свой список",
+        "last_synced_preset": "Свой список",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -177,6 +178,33 @@ def competitor_editor() -> List[CompetitorInput]:
     return competitors
 
 
+def empty_competitor_row() -> Dict[str, str]:
+    return {"name": "", "url": "", "manual_text": "", "uploaded_text": ""}
+
+
+def reset_competitor_widget_state(max_rows: int = 40) -> None:
+    for index in range(max_rows):
+        for prefix in ["name", "url", "manual", "files"]:
+            key = f"{prefix}_{index}"
+            if key in st.session_state:
+                del st.session_state[key]
+
+
+def set_competitors_from_preset(preset_name: str) -> None:
+    preset_rows = preset_competitors(preset_name)
+    st.session_state.competitors = preset_rows + [empty_competitor_row()]
+    st.session_state.last_synced_preset = preset_name
+    reset_competitor_widget_state()
+
+
+def ensure_preset_competitors_loaded() -> None:
+    preset_name = st.session_state.active_preset
+    if preset_name == "Свой список":
+        return
+    if st.session_state.last_synced_preset != preset_name:
+        set_competitors_from_preset(preset_name)
+
+
 def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
     st.subheader("Экспорт")
     df = cells_to_dataframe(run.cells)
@@ -227,7 +255,7 @@ def apply_selected_preset() -> None:
     selected = st.session_state.get("preset_selector", "Свой список")
     st.session_state.active_preset = selected
     if selected != "Свой список":
-        st.session_state.competitors = preset_competitors(selected)
+        set_competitors_from_preset(selected)
         st.session_state.current_message = f"Пресет выбран: {selected}"
 
 
@@ -280,6 +308,7 @@ left, right = st.columns([0.38, 0.62], gap="large")
 
 with left:
     template = template_editor(default_template)
+    ensure_preset_competitors_loaded()
     competitors = competitor_editor()
     run_button = st.button("Запустить исследование", type="primary", use_container_width=True)
 
