@@ -132,25 +132,17 @@ def render_review_table(run: ResearchRun) -> Dict[str, Dict[str, Dict[str, objec
 
 
 def render_insights(insights: Dict[str, object]) -> None:
-    st.subheader("AI-аналитика")
-    tabs = st.tabs(["Резюме", "Стратегия", "Продажи и UX", "SWOT", "Неопределённость"])
-    with tabs[0]:
-        render_list("Краткое резюме", insights.get("executive_summary", []))
-        render_list("Продуктовые выводы", insights.get("product_conclusions", []))
-    with tabs[1]:
-        render_list("Конкурентные преимущества", insights.get("competitive_advantages", []))
-        render_list("Пробелы", insights.get("gaps", []))
-        render_list("Рекомендации", insights.get("recommendations", []))
-        render_list("Позиционирование", insights.get("positioning_analysis", []))
-    with tabs[2]:
-        render_list("Выводы для продаж", insights.get("sales_insights", []))
-        render_list("UX-выводы", insights.get("ux_insights", []))
-        render_list("Сравнение ценностных предложений", insights.get("value_proposition_comparison", []))
-    with tabs[3]:
-        render_swot(insights.get("swot", {}))
-    with tabs[4]:
-        render_list("Замечания по неопределённости", insights.get("uncertainty_notes", []))
-        st.json(insights.get("conflicts", {}), expanded=False)
+    st.subheader("Выводы по таблице")
+    tbank_items = insights.get("tbank_vs_market", [])
+    parameter_items = insights.get("parameter_comparison", [])
+    if tbank_items:
+        tabs = st.tabs(["Т-Банк vs рынок", "Компании по параметрам"])
+        with tabs[0]:
+            render_list("Сравнение Т-Банка с рынком", tbank_items)
+        with tabs[1]:
+            render_list("Сравнение компаний между собой по каждому параметру", parameter_items)
+    else:
+        render_list("Сравнение компаний между собой по каждому параметру", parameter_items)
 
 
 def render_list(title: str, items: object) -> None:
@@ -162,20 +154,6 @@ def render_list(title: str, items: object) -> None:
         st.json(items, expanded=False)
     else:
         st.caption("Нет данных.")
-
-
-def render_swot(swot: object) -> None:
-    if not isinstance(swot, dict) or not swot:
-        st.caption("Нет данных.")
-        return
-    title_map = {
-        "strengths": "Сильные стороны",
-        "weaknesses": "Слабые стороны",
-        "opportunities": "Возможности",
-        "threats": "Риски",
-    }
-    for key, title in title_map.items():
-        render_list(title, swot.get(key, []))
 
 
 def template_editor(default_template: ResearchTemplate) -> ResearchTemplate:
@@ -190,6 +168,5 @@ def template_editor(default_template: ResearchTemplate) -> ResearchTemplate:
         name=default_template.name,
         research_type=default_template.research_type,
         groups=groups,
-        audience=default_template.audience,
         detail_level=default_template.detail_level,
     )

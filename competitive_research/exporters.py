@@ -17,18 +17,8 @@ STATUS_LABELS = {
 }
 
 INSIGHT_SECTION_LABELS = {
-    "executive_summary": "Краткое резюме",
-    "strengths_weaknesses": "Сильные и слабые стороны",
-    "competitive_advantages": "Конкурентные преимущества",
-    "gaps": "Пробелы",
-    "recommendations": "Рекомендации",
-    "sales_insights": "Выводы для продаж",
-    "ux_insights": "UX-выводы",
-    "product_conclusions": "Продуктовые выводы",
-    "swot": "SWOT",
-    "positioning_analysis": "Позиционирование",
-    "value_proposition_comparison": "Сравнение ценностных предложений",
-    "uncertainty_notes": "Неопределённость",
+    "tbank_vs_market": "Сравнение Т-Банка с рынком",
+    "parameter_comparison": "Сравнение компаний по параметрам",
     "conflicts": "Конфликты данных",
 }
 

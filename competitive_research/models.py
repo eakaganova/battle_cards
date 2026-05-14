@@ -62,7 +62,6 @@ class ResearchTemplate:
     name: str
     research_type: str
     groups: Dict[str, List[str]]
-    audience: str = "Executive"
     detail_level: str = "Balanced"
 
     @property

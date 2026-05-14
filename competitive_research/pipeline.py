@@ -30,7 +30,6 @@ class ResearchPipeline:
         research_type: str,
         competitors: List[CompetitorInput],
         template: ResearchTemplate,
-        audience: str,
         detail_level: str,
         rerun_from_stage: Optional[str] = None,
         previous_run: Optional[Dict[str, object]] = None,
@@ -128,8 +127,8 @@ class ResearchPipeline:
         run.stage("Проверка конфликтов").finish(status, conflicts=sum(len(v) for v in conflicts.values()))
         run.insights["conflicts"] = conflicts
 
-        self._stage(run, "Генерация выводов", "Генерирую краткое резюме, SWOT и рекомендации.", on_event, 0.88)
-        run.insights.update(self.generate_insights(run, audience, detail_level))
+        self._stage(run, "Генерация выводов", "Генерирую сравнение Т-Банка с рынком и сравнение компаний по параметрам.", on_event, 0.88)
+        run.insights.update(self.generate_insights(run, detail_level))
         run.stage("Генерация выводов").finish(StageStatus.SUCCESS)
 
         self._stage(run, "Экспорт", "Сохраняю JSON-версию исследования.", on_event, 0.96)
@@ -140,7 +139,7 @@ class ResearchPipeline:
             on_event(run, "Готово", "Исследование сохранено и готово к проверке и экспорту.", 1.0)
         return run
 
-    def generate_insights(self, run: ResearchRun, audience: str, detail_level: str) -> Dict[str, object]:
+    def generate_insights(self, run: ResearchRun, detail_level: str) -> Dict[str, object]:
         compact_table = {
             competitor: {
                 field: {
@@ -156,12 +155,14 @@ class ResearchPipeline:
             run.title,
             run.research_type,
             json.dumps(compact_table, ensure_ascii=False),
-            audience,
             detail_level,
+            has_tbank=has_tbank_competitor(list(run.cells.keys())),
         )
         payload = self._complete_json_with_fallback(prompt, run, "Генерация выводов", "")
-        if not payload or "executive_summary" not in payload:
+        if not payload or "parameter_comparison" not in payload:
             payload = heuristic_insights(compact_table)
+        if not has_tbank_competitor(list(run.cells.keys())):
+            payload["tbank_vs_market"] = []
         return payload
 
     def _complete_json_with_fallback(self, prompt: str, run: ResearchRun, stage: str, competitor: str) -> Dict[str, object]:
@@ -194,28 +195,52 @@ class ResearchPipeline:
 
 
 def heuristic_insights(table: Dict[str, Dict[str, Dict[str, object]]]) -> Dict[str, object]:
-    missing = []
-    low_confidence = []
-    for competitor, fields in table.items():
-        for field, data in fields.items():
-            if data.get("status") == "missing":
-                missing.append(f"{competitor}: {field}")
-            if float(data.get("confidence") or 0) < 0.55 and data.get("value"):
-                low_confidence.append(f"{competitor}: {field}")
+    competitors = list(table.keys())
+    fields = []
+    for competitor_fields in table.values():
+        for field in competitor_fields.keys():
+            if field not in fields:
+                fields.append(field)
+
+    parameter_comparison = []
+    for field in fields:
+        available = [
+            (competitor, str(table.get(competitor, {}).get(field, {}).get("value", "") or ""))
+            for competitor in competitors
+        ]
+        available = [(competitor, value) for competitor, value in available if value]
+        if len(available) < 2:
+            parameter_comparison.append(
+                f"По {field} невозможно надёжно определить лучшие и худшие условия: недостаточно данных у конкурентов."
+            )
+            continue
+        values_text = "; ".join(f"{competitor}: {value}" for competitor, value in available)
+        parameter_comparison.append(
+            f"По {field} требуется экспертная проверка лучших и худших условий: {values_text}."
+        )
+
+    tbank_vs_market = []
+    if has_tbank_competitor(competitors):
+        tbank_name = next(name for name in competitors if is_tbank_name(name))
+        for field in fields:
+            tbank_value = table.get(tbank_name, {}).get(field, {}).get("value", "")
+            if not tbank_value:
+                tbank_vs_market.append(f"Т-Банк хуже конкурентов по параметру «{field}»: данные по Т-Банку не найдены.")
+            else:
+                tbank_vs_market.append(
+                    f"Т-Банк наравне с конкурентами по параметру «{field}»: значение требует экспертной проверки на основе таблицы."
+                )
+
     return {
-        "executive_summary": [
-            "Исследование собрано в evidence-first формате.",
-            "Выводы ограничены полнотой источников и ячейками с низкой уверенностью.",
-        ],
-        "strengths_weaknesses": {},
-        "competitive_advantages": [],
-        "gaps": missing[:20],
-        "recommendations": ["Проверить ячейки со статусами needs_review и conflicting перед презентацией результатов."],
-        "sales_insights": [],
-        "ux_insights": [],
-        "product_conclusions": [],
-        "swot": {"strengths": [], "weaknesses": missing[:10], "opportunities": [], "threats": low_confidence[:10]},
-        "positioning_analysis": [],
-        "value_proposition_comparison": [],
-        "uncertainty_notes": low_confidence[:20],
+        "tbank_vs_market": tbank_vs_market,
+        "parameter_comparison": parameter_comparison,
     }
+
+
+def has_tbank_competitor(competitors: List[str]) -> bool:
+    return any(is_tbank_name(name) for name in competitors)
+
+
+def is_tbank_name(name: str) -> bool:
+    normalized = name.lower().replace("ё", "е").replace("-", "").replace(" ", "")
+    return normalized in {"тбанк", "tbank", "тинькофф", "тинькоффбанк"} or "тбанк" in normalized or "tbank" in normalized

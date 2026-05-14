@@ -4,7 +4,7 @@ from typing import Iterable, List
 
 
 EXTRACTION_PROMPT_VERSION = "extraction.v3.ru-evidence"
-ANALYTICS_PROMPT_VERSION = "analytics.v3.ru-board-ready"
+ANALYTICS_PROMPT_VERSION = "analytics.v4.strict-comparison-formats"
 
 
 def build_extraction_prompt(
@@ -82,34 +82,45 @@ def build_schema_alignment_prompt(parameters: List[str], extracted_fields: List[
 """.strip()
 
 
-def build_analytics_prompt(title: str, research_type: str, table_json: str, audience: str, detail_level: str) -> str:
+def build_analytics_prompt(
+    title: str,
+    research_type: str,
+    table_json: str,
+    detail_level: str,
+    has_tbank: bool,
+) -> str:
     return f"""
-Ты senior product strategist для русскоязычной аудитории.
-Сгенерируй выводы конкурентного анализа на русском языке на основе JSON battle-card.
-Не скрывай неопределённость: отдельно укажи, какие выводы зависят от ячеек с низкой уверенностью.
-Не используй английские фразы вроде "executive summary", "gaps", "sales insights" внутри текста выводов.
-Ключи JSON оставь как в схеме ниже, но все значения внутри массивов и объектов должны быть на русском языке.
+Ты аналитик конкурентных карт для русскоязычной аудитории.
+Сгенерируй выводы строго в двух разрешённых форматах. Никаких SWOT, summary, recommendations, sales insights, UX insights и общих рассуждений.
+
+Разрешённые форматы:
+1. tbank_vs_market: только если has_tbank=true. Каждый пункт обязан начинаться одной из фраз:
+   - "Т-Банк лучше конкурентов ..."
+   - "Т-Банк наравне с конкурентами ..."
+   - "Т-Банк хуже конкурентов ..."
+   Если has_tbank=false, верни пустой список tbank_vs_market=[].
+2. parameter_comparison: сравнение компаний между собой по каждому параметру.
+   Формат каждого пункта: "По <параметр> лучшие условия предлагает <компания>, а худшие — <компания>."
+   Если лучшего/худшего нельзя определить из-за отсутствия или неоднозначности данных, явно напиши:
+   "По <параметр> невозможно надёжно определить лучшие и худшие условия: <причина>."
+
+Правила:
+- Используй только данные из table_json.
+- Не придумывай значения.
+- Если данные отсутствуют, так и пиши.
+- Все тексты должны быть на русском.
+- Не добавляй другие разделы и другие ключи JSON.
 
 Верни только JSON:
 {{
-  "executive_summary": ["..."],
-  "strengths_weaknesses": {{"competitor": {{"strengths": ["..."], "weaknesses": ["..."]}}}},
-  "competitive_advantages": ["..."],
-  "gaps": ["..."],
-  "recommendations": ["..."],
-  "sales_insights": ["..."],
-  "ux_insights": ["..."],
-  "product_conclusions": ["..."],
-  "swot": {{"strengths": ["..."], "weaknesses": ["..."], "opportunities": ["..."], "threats": ["..."]}},
-  "positioning_analysis": ["..."],
-  "value_proposition_comparison": ["..."],
-  "uncertainty_notes": ["..."]
+  "tbank_vs_market": ["..."],
+  "parameter_comparison": ["..."]
 }}
 
 title={title}
 research_type={research_type}
-audience={audience}
 detail_level={detail_level}
+has_tbank={str(has_tbank).lower()}
 prompt_version={ANALYTICS_PROMPT_VERSION}
 
 Battle-card JSON:
