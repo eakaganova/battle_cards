@@ -158,6 +158,11 @@ def render_list(title: str, items: object) -> None:
 
 def template_editor(default_template: ResearchTemplate) -> ResearchTemplate:
     st.markdown("#### Конструктор сравнительной таблицы")
+    st.caption(
+        "Параметры ниже — это целевая схема исследования. Модель будет искать именно эти пункты "
+        "в источниках и нормализовать ответы под них. Можно редактировать формулировки, но лучше "
+        "оставлять один параметр на строку: например «ПСК», «Срок кредита», «Требования к заёмщику»."
+    )
     groups: Dict[str, List[str]] = {}
     for group, values in default_template.groups.items():
         text = st.text_area(group, value="\n".join(values), height=150, key=f"group_{group}")

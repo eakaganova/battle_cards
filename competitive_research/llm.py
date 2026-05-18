@@ -24,10 +24,11 @@ class OpenAICompatibleProvider(LLMProvider):
         base_url: str | None = None,
         default_headers: Dict[str, str] | None = None,
         use_response_format: bool = True,
+        timeout_seconds: float = 75,
     ):
         from openai import OpenAI
 
-        self.client = OpenAI(api_key=api_key, base_url=base_url, default_headers=default_headers)
+        self.client = OpenAI(api_key=api_key, base_url=base_url, default_headers=default_headers, timeout=timeout_seconds)
         self.model = model
         self.use_response_format = use_response_format
 
@@ -79,7 +80,7 @@ class HeuristicProvider(LLMProvider):
 
 def provider_from_config(config: AppConfig) -> LLMProvider:
     if config.llm_provider in {"openai", "auto"} and config.openai_api_key:
-        return OpenAICompatibleProvider(config.openai_api_key, config.openai_model)
+        return OpenAICompatibleProvider(config.openai_api_key, config.openai_model, timeout_seconds=config.llm_timeout_seconds)
     if config.llm_provider in {"yandex", "auto"} and config.yandex_api_key and config.yandex_folder:
         return OpenAICompatibleProvider(
             api_key=config.yandex_api_key,
@@ -87,6 +88,7 @@ def provider_from_config(config: AppConfig) -> LLMProvider:
             base_url=config.yandex_base_url,
             default_headers={"x-folder-id": config.yandex_folder},
             use_response_format=False,
+            timeout_seconds=config.llm_timeout_seconds,
         )
     return HeuristicProvider()
 

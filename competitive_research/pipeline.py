@@ -6,9 +6,9 @@ from typing import Callable, Dict, List, Optional
 from .cache import JsonCache
 from .config import AppConfig
 from .llm import HeuristicProvider, cells_from_llm_payload, provider_from_config
-from .models import CompetitorInput, EvidenceCell, ResearchRun, ResearchTemplate, StageStatus
+from .models import CompetitorInput, EvidenceCell, ResearchRun, ResearchTemplate, SourceArtifact, StageStatus
 from .normalization import align_cells_to_schema, detect_conflicts
-from .parser import chunk_text, fetch_source, prepare_text_for_llm, select_focused_chunks
+from .parser import artifact_to_cache_value, chunk_text, fetch_source, prepare_text_for_llm, select_focused_chunks
 from .prompts import EXTRACTION_PROMPT_VERSION, build_analytics_prompt, build_extraction_prompt
 from .storage import ResearchStorage, new_run_id
 
@@ -54,14 +54,37 @@ class ResearchPipeline:
         self._stage(run, "Парсинг", "Начинаю сбор страниц и резервных источников.", on_event, 0.08)
         for index, competitor in enumerate(valid_competitors, start=1):
             run.log("INFO", "Сбор источника начат.", "Парсинг", competitor.display_name())
-            artifact = fetch_source(
-                competitor=competitor.display_name(),
-                url=competitor.url,
-                manual_text=competitor.manual_text,
-                uploaded_text=competitor.uploaded_text,
-                config=self.config,
-                progress=lambda stage, name, message: self._progress_log(run, on_event, stage, name, message, 0.08 + index / max(len(valid_competitors), 1) * 0.20),
-            )
+            source_cache_key = self._source_cache_key(competitor)
+            cached_artifact = self.cache.get("source_artifacts", source_cache_key) if source_cache_key else None
+            if cached_artifact:
+                artifact = SourceArtifact(**cached_artifact)
+                run.log("INFO", "Использую сохранённый источник из кэша.", "Парсинг", competitor.display_name())
+            else:
+                try:
+                    artifact = fetch_source(
+                        competitor=competitor.display_name(),
+                        url=competitor.url,
+                        manual_text=competitor.manual_text,
+                        uploaded_text=competitor.uploaded_text,
+                        config=self.config,
+                        progress=lambda stage, name, message: self._progress_log(run, on_event, stage, name, message, 0.08 + index / max(len(valid_competitors), 1) * 0.20),
+                    )
+                    if source_cache_key and artifact.status != "failed":
+                        self.cache.set("source_artifacts", source_cache_key, artifact_to_cache_value(artifact))
+                except Exception as exc:
+                    artifact = SourceArtifact(
+                        competitor=competitor.display_name(),
+                        url=competitor.url,
+                        status="failed",
+                        errors=[str(exc)],
+                        extraction_method="parser_failed",
+                    )
+                    run.log(
+                        "ERROR",
+                        f"Источник не удалось собрать, продолжаю исследование без него: {exc}",
+                        "Парсинг",
+                        competitor.display_name(),
+                    )
             artifacts.append(artifact)
             if artifact.errors:
                 run.log("ERROR", "; ".join(artifact.errors), "Парсинг", competitor.display_name())
@@ -118,11 +141,21 @@ class ResearchPipeline:
             chunks = chunks_by_competitor.get(artifact.competitor, [])
             for chunk_index, chunk in enumerate(chunks, start=1):
                 prompt = build_extraction_prompt(artifact.competitor, artifact.url, research_type, template.parameters, chunk)
-                cache_key = f"parser_v10_dedup_focused_chunks|{EXTRACTION_PROMPT_VERSION}|{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
+                cache_key = f"parser_v12_resilient_sources|{EXTRACTION_PROMPT_VERSION}|{artifact.url}|{template.parameters}|{chunk_index}|{chunk[:600]}"
                 payload = self.cache.get("llm_extraction", cache_key)
                 if payload is None:
+                    self._progress_log(
+                        run,
+                        on_event,
+                        "LLM extraction",
+                        artifact.competitor,
+                        f"Chunk {chunk_index}/{len(chunks)} отправлен в модель, жду ответ.",
+                        0.50,
+                    )
                     payload = self._complete_json_with_fallback(prompt, run, "LLM extraction", artifact.competitor)
                     self.cache.set("llm_extraction", cache_key, payload)
+                else:
+                    run.log("INFO", f"Chunk {chunk_index}/{len(chunks)} взят из кэша.", "LLM extraction", artifact.competitor)
                 raw_cells.extend(cells_from_llm_payload(payload, artifact.url))
                 run.log("INFO", f"Chunk {chunk_index}/{len(chunks)} обработан.", "LLM extraction", artifact.competitor)
             raw_cells_by_competitor[artifact.competitor] = raw_cells
@@ -186,6 +219,18 @@ class ResearchPipeline:
         if not has_tbank_competitor(list(run.cells.keys())):
             payload["tbank_vs_market"] = []
         return payload
+
+    def _source_cache_key(self, competitor: CompetitorInput) -> str:
+        if competitor.manual_text.strip() or competitor.uploaded_text.strip() or not competitor.url.strip():
+            return ""
+        return (
+            "source_v2|"
+            f"{competitor.display_name()}|{competitor.url.strip()}|"
+            f"{self.config.playwright_networkidle_timeout_ms}|"
+            f"{self.config.browser_interaction_budget_seconds}|"
+            f"{self.config.accordion_budget_seconds}|"
+            f"{self.config.tabs_budget_seconds}"
+        )
 
     def _complete_json_with_fallback(self, prompt: str, run: ResearchRun, stage: str, competitor: str) -> Dict[str, object]:
         try:

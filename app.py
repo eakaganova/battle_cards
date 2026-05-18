@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List
 
@@ -51,32 +52,97 @@ CONFIG = AppConfig()
 ensure_directories(CONFIG)
 STORAGE = ResearchStorage(CONFIG)
 CACHE = JsonCache(CONFIG.cache_dir)
+DRAFT_PATH = CONFIG.data_dir / "draft_state.json"
+
+
+def load_draft_state() -> Dict[str, object]:
+    if not DRAFT_PATH.exists():
+        return {}
+    try:
+        return json.loads(DRAFT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_draft_state() -> None:
+    payload = {
+        "competitors": st.session_state.get("competitors", []),
+        "active_preset": st.session_state.get("active_preset", "Свой список"),
+        "template_groups": st.session_state.get("template_groups", DEFAULT_TEMPLATE_GROUPS),
+        "preset_selector": st.session_state.get("preset_selector", "Свой список"),
+    }
+    DRAFT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def init_state() -> None:
+    draft = load_draft_state()
     defaults = {
         "current_run": None,
         "current_progress": 0.0,
         "current_message": "Готов к запуску.",
+        "current_last_event_at": None,
+        "last_autosave_at": 0.0,
         "run_started_at": None,
+        "is_running": False,
         "competitors": [
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
             {"name": "", "url": "", "manual_text": "", "uploaded_text": ""},
         ],
         "active_preset": "Свой список",
+        "template_groups": deepcopy(DEFAULT_TEMPLATE_GROUPS),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
-            st.session_state[key] = value
+            st.session_state[key] = draft.get(key, value)
     if "preset_selector" not in st.session_state:
-        st.session_state.preset_selector = st.session_state.active_preset
+        st.session_state.preset_selector = draft.get("preset_selector", st.session_state.active_preset)
+
+
+def reset_template_widget_state() -> None:
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("group_"):
+            del st.session_state[key]
+
+
+def sync_competitor_rows_from_widgets() -> None:
+    for index, row in enumerate(st.session_state.competitors):
+        widget_map = {
+            "name": f"name_{index}",
+            "url": f"url_{index}",
+            "manual_text": f"manual_{index}",
+        }
+        for field, key in widget_map.items():
+            if key in st.session_state:
+                row[field] = st.session_state.get(key, "")
+    save_draft_state()
+
+
+def compact_competitor_rows() -> None:
+    sync_competitor_rows_from_widgets()
+    kept = []
+    for row in st.session_state.competitors:
+        normalized = {
+            "name": str(row.get("name", "")),
+            "url": str(row.get("url", "")),
+            "manual_text": str(row.get("manual_text", "")),
+            "uploaded_text": str(row.get("uploaded_text", "")),
+        }
+        if any(value.strip() for value in normalized.values()):
+            kept.append(normalized)
+    st.session_state.competitors = kept or [empty_competitor_row()]
+    reset_competitor_widget_state()
+    save_draft_state()
 
 
 def extract_uploaded_text(files) -> str:
     parts: List[str] = []
     for file in files or []:
         name = file.name.lower()
+        try:
+            file.seek(0)
+        except Exception:
+            pass
         content = file.read()
         try:
             if name.endswith(".pdf"):
@@ -103,6 +169,13 @@ def run_event(run: ResearchRun, stage: str, message: str, progress: float) -> No
     st.session_state.current_run = run
     st.session_state.current_progress = progress
     st.session_state.current_message = f"{stage}: {message}"
+    st.session_state.current_last_event_at = time.time()
+    if time.time() - float(st.session_state.get("last_autosave_at", 0.0) or 0.0) >= 10:
+        try:
+            STORAGE.save_run(run)
+            st.session_state.last_autosave_at = time.time()
+        except Exception:
+            pass
     status_placeholder.empty()
     with status_placeholder.container():
         render_compact_runtime_status()
@@ -125,6 +198,11 @@ def elapsed_runtime_text() -> str:
 
 def render_compact_runtime_status() -> None:
     progress_percent = int(float(st.session_state.current_progress or 0.0) * 100)
+    last_event_at = st.session_state.get("current_last_event_at")
+    last_event_text = "нет"
+    if last_event_at:
+        seconds_ago = max(0, int(time.time() - last_event_at))
+        last_event_text = f"{seconds_ago} сек. назад"
     st.markdown(
         f"""
         <div class="runtime-line">
@@ -132,6 +210,7 @@ def render_compact_runtime_status() -> None:
             <div class="runtime-meta">
                 <span>Время: {elapsed_runtime_text()}</span>
                 <span>Прогресс: {progress_percent}%</span>
+                <span>Последний сигнал: {last_event_text}</span>
             </div>
         </div>
         """,
@@ -165,14 +244,12 @@ def competitor_editor() -> List[CompetitorInput]:
                 competitors.append(CompetitorInput(**row))
     add_col, clean_col = st.columns(2)
     if add_col.button("Добавить конкурента", use_container_width=True):
+        sync_competitor_rows_from_widgets()
         st.session_state.competitors.append({"name": "", "url": "", "manual_text": "", "uploaded_text": ""})
+        save_draft_state()
         st.rerun()
     if clean_col.button("Удалить пустые строки", use_container_width=True):
-        st.session_state.competitors = [
-            item
-            for item in st.session_state.competitors
-            if item["name"].strip() or item["url"].strip() or item["manual_text"].strip() or item["uploaded_text"].strip()
-        ] or [{"name": "", "url": "", "manual_text": "", "uploaded_text": ""}]
+        compact_competitor_rows()
         st.rerun()
     return competitors
 
@@ -190,10 +267,17 @@ def reset_competitor_widget_state(max_rows: int = 40) -> None:
 
 
 def sync_selected_preset(selected_preset: str) -> None:
+    if selected_preset != st.session_state.active_preset:
+        st.session_state.template_groups = (
+            preset_groups(selected_preset) if selected_preset != "Свой список" else deepcopy(DEFAULT_TEMPLATE_GROUPS)
+        )
+        reset_template_widget_state()
     st.session_state.active_preset = selected_preset
+    save_draft_state()
 
 
 def add_companies_to_editor(companies: List[Dict[str, str]]) -> None:
+    sync_competitor_rows_from_widgets()
     current_rows = [
         row
         for row in st.session_state.competitors
@@ -208,6 +292,7 @@ def add_companies_to_editor(companies: List[Dict[str, str]]) -> None:
     current_rows.append(empty_competitor_row())
     st.session_state.competitors = current_rows
     reset_competitor_widget_state()
+    save_draft_state()
     st.rerun()
 
 
@@ -311,7 +396,7 @@ research_type = preset_research_type(st.session_state.active_preset) if st.sessi
 default_template = ResearchTemplate(
     name=st.session_state.active_preset if st.session_state.active_preset != "Свой список" else "Свой шаблон",
     research_type=research_type,
-    groups=preset_groups(st.session_state.active_preset) if st.session_state.active_preset != "Свой список" else DEFAULT_TEMPLATE_GROUPS,
+    groups=st.session_state.template_groups,
     detail_level=detail_level,
 )
 
@@ -319,8 +404,15 @@ left, right = st.columns([0.38, 0.62], gap="large")
 
 with left:
     template = template_editor(default_template)
+    st.session_state.template_groups = template.groups
+    save_draft_state()
     competitors = competitor_editor()
-    run_button = st.button("Запустить исследование", type="primary", use_container_width=True)
+    run_button = st.button(
+        "Запустить исследование",
+        type="primary",
+        use_container_width=True,
+        disabled=bool(st.session_state.get("is_running")),
+    )
 
 with right:
     context_cols = st.columns(3)
@@ -337,28 +429,46 @@ with right:
             render_live_logs(st.session_state.current_run)
 
 if run_button:
+    st.session_state.is_running = True
+    sync_competitor_rows_from_widgets()
+    competitors = [
+        CompetitorInput(**row)
+        for row in st.session_state.competitors
+        if row.get("name", "").strip()
+        or row.get("url", "").strip()
+        or row.get("manual_text", "").strip()
+        or row.get("uploaded_text", "").strip()
+    ]
     st.session_state.run_started_at = time.time()
+    st.session_state.current_last_event_at = time.time()
+    st.session_state.last_autosave_at = 0.0
     st.session_state.current_progress = 0.0
     st.session_state.current_message = "Запуск исследования"
     previous_data = None
     if previous_choice != "Нет":
         previous_run_id = previous_choice.split(" · ", 1)[0]
         previous_data = STORAGE.load_run(previous_run_id)
-    pipeline = ResearchPipeline(CONFIG, STORAGE, CACHE)
-    run = pipeline.run(
-        title=title,
-        research_type=research_type,
-        competitors=competitors,
-        template=template,
-        detail_level=detail_level,
-        rerun_from_stage=None if rerun_from_stage == "Полный запуск" else rerun_from_stage,
-        previous_run=previous_data,
-        on_event=run_event,
-    )
-    st.session_state.current_run = run
-    st.session_state.current_progress = 1.0
-    st.session_state.current_message = f"Готово: исследование сохранено {run.run_id}"
-    st.success(f"Исследование сохранено: {run.run_id}")
+    try:
+        pipeline = ResearchPipeline(CONFIG, STORAGE, CACHE)
+        run = pipeline.run(
+            title=title,
+            research_type=research_type,
+            competitors=competitors,
+            template=template,
+            detail_level=detail_level,
+            rerun_from_stage=None if rerun_from_stage == "Полный запуск" else rerun_from_stage,
+            previous_run=previous_data,
+            on_event=run_event,
+        )
+        st.session_state.current_run = run
+        st.session_state.current_progress = 1.0
+        st.session_state.current_message = f"Готово: исследование сохранено {run.run_id}"
+        st.success(f"Исследование сохранено: {run.run_id}")
+    except Exception as exc:
+        st.session_state.current_message = f"Ошибка: {exc}"
+        st.error(f"Исследование остановилось с ошибкой: {exc}")
+    finally:
+        st.session_state.is_running = False
 
 run = st.session_state.current_run
 if run:

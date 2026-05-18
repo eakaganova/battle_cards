@@ -719,12 +719,12 @@ def clean_text(text: str) -> str:
 
 def prepare_text_for_llm(text: str) -> str:
     cleaned = clean_text(text)
-    cleaned = remove_repeated_short_lines(cleaned)
-    cleaned = deduplicate_paragraphs(cleaned)
+    cleaned = remove_repeated_ui_lines(cleaned)
+    cleaned = deduplicate_exact_paragraphs(cleaned)
     return clean_text(cleaned)
 
 
-def remove_repeated_short_lines(text: str) -> str:
+def remove_repeated_ui_lines(text: str) -> str:
     lines: List[str] = []
     seen_counts: Dict[str, int] = {}
     for line in text.splitlines():
@@ -736,17 +736,16 @@ def remove_repeated_short_lines(text: str) -> str:
         if len(normalized) < 8:
             continue
         seen_counts[normalized] = seen_counts.get(normalized, 0) + 1
-        if len(line) <= 120 and seen_counts[normalized] > 2:
+        if is_low_value_ui_line(line) and seen_counts[normalized] > 1:
             continue
         lines.append(line)
     return "\n".join(lines)
 
 
-def deduplicate_paragraphs(text: str) -> str:
+def deduplicate_exact_paragraphs(text: str) -> str:
     paragraphs = re.split(r"\n{2,}", text)
     result: List[str] = []
     seen = set()
-    long_fingerprints: List[str] = []
     for paragraph in paragraphs:
         paragraph = clean_text(paragraph)
         if not paragraph:
@@ -755,27 +754,26 @@ def deduplicate_paragraphs(text: str) -> str:
         if len(normalized) < 20:
             result.append(paragraph)
             continue
-        fingerprint = normalized[:240]
+        fingerprint = normalized
         if fingerprint in seen:
             continue
-        if is_near_duplicate(normalized, long_fingerprints):
-            continue
         seen.add(fingerprint)
-        if len(normalized) >= 160:
-            long_fingerprints.append(fingerprint)
-            long_fingerprints = long_fingerprints[-700:]
         result.append(paragraph)
     return "\n\n".join(result)
 
 
-def is_near_duplicate(normalized: str, fingerprints: List[str]) -> bool:
-    if len(normalized) < 160:
+def is_low_value_ui_line(line: str) -> bool:
+    if len(line) > 80:
         return False
-    head = normalized[:180]
-    for fingerprint in fingerprints:
-        if head in fingerprint or fingerprint[:180] in normalized:
-            return True
-    return False
+    if re.search(r"\d|%|₽|руб|год|лет|месяц|ставк|пск|срок|сумм|кредит|залог", line.lower()):
+        return False
+    return bool(
+        re.fullmatch(
+            r"(меню|назад|далее|подробнее|открыть|закрыть|показать|скрыть|выбрать|оформить|оставить заявку|перезвоните мне|войти|личный кабинет|cookie|ok|accept)",
+            line.strip().lower(),
+        )
+    )
+
 
 
 def normalize_for_dedupe(text: str) -> str:
@@ -835,6 +833,8 @@ def normalize_unicode_punctuation(text: str) -> str:
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+    if not text.strip():
+        return []
     if len(text) <= chunk_size:
         return [text]
     chunks: List[str] = []
@@ -873,6 +873,9 @@ def select_focused_chunks(
     scored.sort(key=lambda item: (-item[0], item[1]))
     relevant = [item for item in scored if item[0] > 0]
     selected = relevant[:max_chunks] if relevant else scored[:max_chunks]
+    first_chunk = next((item for item in scored if item[1] == 0), None)
+    if first_chunk and all(item[1] != 0 for item in selected):
+        selected = [first_chunk] + selected[: max_chunks - 1]
     selected.sort(key=lambda item: item[1])
     return [chunk for _, _, chunk in selected]
 
@@ -901,6 +904,15 @@ def relevance_keywords(parameters: List[str], research_type: str = "") -> List[s
         "кредит",
         "тариф",
         "услов",
+        "накопительн",
+        "счет",
+        "счёт",
+        "доход",
+        "доходност",
+        "пополн",
+        "снят",
+        "процент",
+        "вклад",
     ]
     text = " ".join(parameters + [research_type])
     words = re.findall(r"[A-Za-zА-Яа-я0-9]{4,}", text.lower())
