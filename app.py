@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import io
 import json
 import time
@@ -107,14 +108,9 @@ def reset_template_widget_state() -> None:
 
 def sync_competitor_rows_from_widgets() -> None:
     for index, row in enumerate(st.session_state.competitors):
-        widget_map = {
-            "name": f"name_{index}",
-            "url": f"url_{index}",
-            "manual_text": f"manual_{index}",
-        }
-        for field, key in widget_map.items():
-            if key in st.session_state:
-                row[field] = st.session_state.get(key, "")
+        manual_key = f"manual_{index}"
+        if manual_key in st.session_state:
+            row["manual_text"] = st.session_state.get(manual_key, "")
     save_draft_state()
 
 
@@ -229,18 +225,59 @@ def render_compact_runtime_status() -> None:
 
 
 def competitor_editor() -> List[CompetitorInput]:
-    st.markdown("#### Конкуренты и резервные источники")
+    st.markdown('<div class="panel-title">Компании и источники</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="panel-caption">Название и URL редактируются как таблица. Ручной текст и файлы можно добавить ниже, если сайт плохо парсится.</div>',
+        unsafe_allow_html=True,
+    )
     competitors: List[CompetitorInput] = []
-    rows = st.session_state.competitors
-    for index, row in enumerate(rows):
-        with st.expander(f"Конкурент {index + 1}", expanded=index < 3):
-            col1, col2 = st.columns([0.8, 1.4])
-            row["name"] = col1.text_input("Название", value=row.get("name", ""), key=f"name_{index}")
-            row["url"] = col2.text_input("URL", value=row.get("url", ""), key=f"url_{index}")
+    current_rows = st.session_state.competitors or [empty_competitor_row()]
+    table_df = pd.DataFrame(
+        [
+            {
+                "Компания": row.get("name", ""),
+                "URL": row.get("url", ""),
+            }
+            for row in current_rows
+        ]
+    )
+    edited_df = st.data_editor(
+        table_df,
+        key="competitor_table",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "Компания": st.column_config.TextColumn("Компания", width="medium"),
+            "URL": st.column_config.TextColumn("URL", width="large"),
+        },
+    )
+
+    updated_rows: List[Dict[str, str]] = []
+    for index, row in edited_df.fillna("").iterrows():
+        previous = current_rows[index] if index < len(current_rows) else empty_competitor_row()
+        updated_rows.append(
+            {
+                "name": str(row.get("Компания", "")).strip(),
+                "url": str(row.get("URL", "")).strip(),
+                "manual_text": previous.get("manual_text", ""),
+                "uploaded_text": previous.get("uploaded_text", ""),
+            }
+        )
+    if not updated_rows:
+        updated_rows = [empty_competitor_row()]
+    st.session_state.competitors = updated_rows
+
+    with st.expander("Резервные источники: ручной текст и файлы", expanded=False):
+        for index, row in enumerate(st.session_state.competitors):
+            label = row.get("name", "").strip() or row.get("url", "").strip() or f"Строка {index + 1}"
+            if not has_filled_competitor_rows([row]) and index > 0:
+                continue
+            st.markdown(f"**{label}**")
             row["manual_text"] = st.text_area(
                 "Ручной текст, если сайт не парсится",
                 value=row.get("manual_text", ""),
-                height=120,
+                height=100,
                 key=f"manual_{index}",
             )
             uploaded_files = st.file_uploader(
@@ -250,17 +287,21 @@ def competitor_editor() -> List[CompetitorInput]:
                 key=f"files_{index}",
             )
             row["uploaded_text"] = extract_uploaded_text(uploaded_files)
-            if row["name"].strip() or row["url"].strip() or row["manual_text"].strip() or row["uploaded_text"].strip():
-                competitors.append(CompetitorInput(**row))
+
     add_col, clean_col = st.columns(2)
     if add_col.button("Добавить конкурента", use_container_width=True):
         sync_competitor_rows_from_widgets()
         st.session_state.competitors.append({"name": "", "url": "", "manual_text": "", "uploaded_text": ""})
+        reset_competitor_widget_state()
         save_draft_state()
         st.rerun()
     if clean_col.button("Удалить пустые строки", use_container_width=True):
         compact_competitor_rows()
         st.rerun()
+    for row in st.session_state.competitors:
+        if row["name"].strip() or row["url"].strip() or row["manual_text"].strip() or row["uploaded_text"].strip():
+            competitors.append(CompetitorInput(**row))
+    save_draft_state()
     return competitors
 
 
@@ -269,6 +310,8 @@ def empty_competitor_row() -> Dict[str, str]:
 
 
 def reset_competitor_widget_state(max_rows: int = 40) -> None:
+    if "competitor_table" in st.session_state:
+        del st.session_state["competitor_table"]
     for index in range(max_rows):
         for prefix in ["name", "url", "manual", "files"]:
             key = f"{prefix}_{index}"
@@ -363,6 +406,76 @@ def render_preset_company_picker(preset_name: str) -> None:
         add_companies_to_editor(selected)
 
 
+def render_preset_cards() -> str:
+    st.markdown("#### Пресеты")
+    custom_active = st.session_state.active_preset == "Свой список"
+    custom_class = "preset-card preset-card-active" if custom_active else "preset-card"
+    st.markdown(
+        f"""
+        <div class="{custom_class}">
+            <div class="preset-name">Свой список</div>
+            <div class="preset-meta">Ручная настройка компаний и параметров</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.button("Выбрать свой список", use_container_width=True, key="preset_card_custom"):
+        st.session_state.preset_selector = "Свой список"
+        sync_selected_preset("Свой список")
+        st.rerun()
+
+    for name in preset_names():
+        groups = preset_groups(name)
+        company_count = len(preset_competitors(name))
+        parameter_count = sum(len(values) for values in groups.values())
+        active = st.session_state.active_preset == name
+        card_class = "preset-card preset-card-active" if active else "preset-card"
+        short_name = name.split(":", 1)[0]
+        st.markdown(
+            f"""
+            <div class="{card_class}">
+                <div class="preset-name">{short_name}</div>
+                <div class="preset-meta">{company_count} компаний · {parameter_count} параметров</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Выбрано" if active else "Выбрать", use_container_width=True, key=f"preset_card_{name}"):
+            st.session_state.preset_selector = name
+            sync_selected_preset(name)
+            st.rerun()
+    return st.session_state.active_preset
+
+
+def render_workspace_header(title: str, research_type: str, template: ResearchTemplate, previous_runs_count: int) -> None:
+    competitor_count = sum(1 for row in st.session_state.competitors if has_filled_competitor_rows([row]))
+    if CONFIG.github_corpus_write_enabled:
+        corpus_status = "GitHub corpus: чтение и запись"
+    elif CONFIG.github_corpus_read_enabled:
+        corpus_status = "GitHub corpus: только чтение"
+    else:
+        corpus_status = "Локальный corpus"
+    safe_title = html.escape(title)
+    safe_research_type = html.escape(research_type)
+    st.markdown(
+        f"""
+        <div class="workspace-header">
+            <div class="workspace-kicker">AI research workspace</div>
+            <div class="workspace-title">{safe_title}</div>
+            <div class="workspace-subtitle">Настройте компании и параметры, запустите сбор источников, затем проверьте готовую конкурентную таблицу, выводы и доказательную базу.</div>
+            <div class="workspace-meta">
+                <span class="meta-pill">{safe_research_type}</span>
+                <span class="meta-pill">{competitor_count} компаний</span>
+                <span class="meta-pill">{len(template.parameters)} параметров</span>
+                <span class="meta-pill">{previous_runs_count} сохранённых запусков</span>
+                <span class="meta-pill">{corpus_status}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
     st.subheader("Экспорт")
     df = cells_to_dataframe(run.cells)
@@ -412,18 +525,11 @@ def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
 init_state()
 apply_pending_competitor_rows()
 
-st.title("AI-платформа конкурентного анализа")
-st.caption("Сравнительные таблицы с источниками, уверенностью, LLM-анализом, проверкой данных, версиями и экспортом.")
+previous_runs = STORAGE.list_runs()
 
 with st.sidebar:
-    st.header("Настройка исследования")
-    preset_options = ["Свой список"] + preset_names()
-    selected_preset = st.selectbox(
-        "Готовый банковский пресет",
-        preset_options,
-        key="preset_selector",
-    )
-    sync_selected_preset(selected_preset)
+    st.header("Настройка")
+    selected_preset = render_preset_cards()
     render_preset_company_picker(selected_preset)
     title = st.text_input("Название исследования", value="Конкурентная таблица")
     detail_level = st.select_slider("Детализация", options=["Short", "Balanced", "Deep"], value="Balanced")
@@ -438,7 +544,6 @@ with st.sidebar:
         ],
     )
     st.divider()
-    previous_runs = STORAGE.list_runs()
     previous_options = ["Нет"] + [f"{item['run_id']} · {item['title']} · {item['updated_at']}" for item in previous_runs]
     previous_choice = st.selectbox("Сравнить с прошлой версией", previous_options)
     st.divider()
@@ -453,6 +558,8 @@ default_template = ResearchTemplate(
     groups=st.session_state.template_groups,
     detail_level=detail_level,
 )
+
+render_workspace_header(title, research_type, default_template, len(previous_runs))
 
 left, right = st.columns([0.38, 0.62], gap="large")
 
@@ -528,26 +635,29 @@ run = st.session_state.current_run
 if run:
     st.divider()
     current_df = cells_to_dataframe(run.cells)
-    st.subheader("Сравнительная таблица")
-    st.dataframe(current_df, use_container_width=True, hide_index=True)
-
-    edited_cells = render_review_table(run)
-    with st.expander("JSON правок", expanded=False):
-        st.json(edited_cells, expanded=False)
-
-    render_insights(run.insights)
-
     previous_data = None
     if previous_choice != "Нет":
         previous_run_id = previous_choice.split(" · ", 1)[0]
         previous_data = STORAGE.load_run(previous_run_id)
     diff = diff_runs(previous_data or {}, run.to_dict()) if previous_data else []
-    st.subheader("Версии и изменения")
-    if diff:
-        st.dataframe(pd.DataFrame(diff), use_container_width=True, hide_index=True)
-    else:
-        st.caption("Diff появится после выбора предыдущего исследования.")
-    render_exports(run, diff)
+
+    result_tabs = st.tabs(["Таблица", "Выводы", "Источники и доверие", "Версии и экспорт"])
+    with result_tabs[0]:
+        st.subheader("Сравнительная таблица")
+        st.dataframe(current_df, use_container_width=True, hide_index=True)
+    with result_tabs[1]:
+        render_insights(run.insights)
+    with result_tabs[2]:
+        edited_cells = render_review_table(run)
+        with st.expander("JSON правок", expanded=False):
+            st.json(edited_cells, expanded=False)
+    with result_tabs[3]:
+        st.subheader("Версии и изменения")
+        if diff:
+            st.dataframe(pd.DataFrame(diff), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Diff появится после выбора предыдущего исследования.")
+        render_exports(run, diff)
 
 with st.expander("Архитектурные заметки", expanded=False):
     st.markdown(

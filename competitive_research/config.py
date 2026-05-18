@@ -43,6 +43,11 @@ class AppConfig:
     yandex_model: str = os.getenv("YANDEX_MODEL", "gpt-oss-120b/latest")
     yandex_base_url: str = os.getenv("YANDEX_BASE_URL", "https://ai.api.cloud.yandex.net/v1")
     github_corpus_enabled: bool = os.getenv("GITHUB_CORPUS_ENABLED", "false").lower() == "true"
+    github_corpus_read_enabled: bool = os.getenv(
+        "GITHUB_CORPUS_READ_ENABLED",
+        os.getenv("GITHUB_CORPUS_ENABLED", "false"),
+    ).lower() == "true"
+    github_corpus_write_enabled: bool = os.getenv("GITHUB_CORPUS_WRITE_ENABLED", "false").lower() == "true"
     github_token: str = os.getenv("GITHUB_TOKEN", "")
     github_repo: str = os.getenv("GITHUB_REPO", "")
     github_branch: str = os.getenv("GITHUB_BRANCH", "main")

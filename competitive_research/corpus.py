@@ -129,15 +129,22 @@ class ResearchCorpus:
         prefix = self.config.github_corpus_path.strip("/ ")
         return f"{prefix}/{namespace}/{key}.json" if prefix else f"{namespace}/{key}.json"
 
-    def _github_ready(self) -> bool:
+    def _github_read_ready(self) -> bool:
         return bool(
-            self.config.github_corpus_enabled
+            self.config.github_corpus_read_enabled
+            and self.config.github_token
+            and self.config.github_repo
+        )
+
+    def _github_write_ready(self) -> bool:
+        return bool(
+            self.config.github_corpus_write_enabled
             and self.config.github_token
             and self.config.github_repo
         )
 
     def _load_from_github(self, namespace: str, key: str) -> Optional[Dict[str, Any]]:
-        if not self._github_ready():
+        if not self._github_read_ready():
             return None
         path = self._github_file_path(namespace, key)
         url = f"https://api.github.com/repos/{self.config.github_repo}/contents/{path}"
@@ -157,7 +164,7 @@ class ResearchCorpus:
             return None
 
     def _save_to_github(self, namespace: str, key: str, payload: Dict[str, Any]) -> None:
-        if not self._github_ready():
+        if not self._github_write_ready():
             return
         path = self._github_file_path(namespace, key)
         url = f"https://api.github.com/repos/{self.config.github_repo}/contents/{path}"

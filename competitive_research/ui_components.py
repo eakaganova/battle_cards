@@ -38,15 +38,38 @@ def inject_workspace_css() -> None:
     st.markdown(
         """
         <style>
-        .block-container {padding-top: 1.4rem; max-width: 1480px;}
+        .stApp {background: #f6f7f9;}
+        .block-container {padding-top: 1.1rem; max-width: 1500px;}
         [data-testid="stMetricValue"] {font-size: 1.4rem;}
+        [data-testid="stSidebar"] {background: #ffffff; border-right: 1px solid #e6e8ec;}
+        h1, h2, h3 {letter-spacing: 0;}
+        .workspace-header {border: 1px solid #e3e7ee; border-radius: 8px; padding: 18px 20px; background: #ffffff; margin-bottom: 16px;}
+        .workspace-kicker {font-size: 12px; text-transform: uppercase; color: #667085; letter-spacing: .08em; font-weight: 650; margin-bottom: 6px;}
+        .workspace-title {font-size: 27px; line-height: 1.2; font-weight: 720; color: #101828; margin-bottom: 7px;}
+        .workspace-subtitle {font-size: 14px; color: #475467; max-width: 980px;}
+        .workspace-meta {display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px;}
+        .meta-pill {border: 1px solid #d0d5dd; border-radius: 999px; background: #f9fafb; color: #344054; font-size: 12px; padding: 5px 10px;}
         .research-shell {border: 1px solid #e4e7ec; border-radius: 8px; padding: 14px 16px; background: #ffffff;}
-        .runtime-line {display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid #e4e7ec; border-radius: 8px; padding: 10px 12px; background: #ffffff; font-size: 14px;}
+        .panel {border: 1px solid #e4e7ec; border-radius: 8px; padding: 16px; background: #ffffff; margin-bottom: 14px;}
+        .panel-title {font-size: 15px; font-weight: 700; color: #182230; margin-bottom: 4px;}
+        .panel-caption {font-size: 13px; color: #667085; margin-bottom: 12px;}
+        .runtime-line {display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid #d7e3f7; border-radius: 8px; padding: 12px 14px; background: #ffffff; font-size: 14px; box-shadow: 0 1px 2px rgba(16,24,40,.04);}
         .runtime-line strong {font-weight: 650;}
-        .runtime-meta {display: flex; gap: 16px; white-space: nowrap; color: #475467;}
+        .runtime-meta {display: flex; gap: 14px; white-space: nowrap; color: #475467;}
         .stage-pill {display: inline-flex; align-items: center; gap: 6px; border: 1px solid #e4e7ec; border-radius: 999px; padding: 4px 10px; margin: 3px; font-size: 12px;}
         .status-dot {width: 8px; height: 8px; border-radius: 50%;}
         .cell-badge {border-radius: 999px; color: white; padding: 2px 8px; font-size: 12px;}
+        .preset-card {border: 1px solid #e4e7ec; border-radius: 8px; padding: 10px 12px; background: #ffffff; min-height: 86px;}
+        .preset-card-active {border-color: #175cd3; background: #eff6ff;}
+        .preset-name {font-weight: 700; color: #101828; font-size: 14px; margin-bottom: 3px;}
+        .preset-meta {font-size: 12px; color: #667085;}
+        .stDataFrame, [data-testid="stDataFrame"] {border-radius: 8px;}
+        div[data-testid="stExpander"] {border: 1px solid #e4e7ec; border-radius: 8px; background: #ffffff;}
+        .stButton > button {border-radius: 8px; font-weight: 650;}
+        @media (max-width: 900px) {
+            .runtime-line {align-items: flex-start; flex-direction: column;}
+            .runtime-meta {white-space: normal; flex-wrap: wrap;}
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -157,7 +180,7 @@ def render_list(title: str, items: object) -> None:
 
 
 def template_editor(default_template: ResearchTemplate) -> ResearchTemplate:
-    st.markdown("#### Конструктор сравнительной таблицы")
+    st.markdown('<div class="panel-title">Параметры сравнения</div>', unsafe_allow_html=True)
     st.caption(
         "Параметры ниже — это целевая схема исследования. Модель будет искать именно эти пункты "
         "в источниках и нормализовать ответы под них. Можно редактировать формулировки, но лучше "
@@ -165,8 +188,23 @@ def template_editor(default_template: ResearchTemplate) -> ResearchTemplate:
     )
     groups: Dict[str, List[str]] = {}
     for group, values in default_template.groups.items():
-        text = st.text_area(group, value="\n".join(values), height=150, key=f"group_{group}")
-        groups[group] = [line.strip() for line in text.splitlines() if line.strip()]
+        with st.expander(group, expanded=True):
+            df = pd.DataFrame({"Параметр": values or [""]})
+            edited_df = st.data_editor(
+                df,
+                key=f"group_table_{group}",
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                column_config={
+                    "Параметр": st.column_config.TextColumn("Параметр", width="large"),
+                },
+            )
+            groups[group] = [
+                str(row.get("Параметр", "")).strip()
+                for _, row in edited_df.fillna("").iterrows()
+                if str(row.get("Параметр", "")).strip()
+            ]
     with st.expander("AI suggestions параметров", expanded=False):
         st.write("Добавьте найденные системой параметры после первого запуска: FAQ, тарифы, SLA, ограничения, документы, интеграции.")
     return ResearchTemplate(
