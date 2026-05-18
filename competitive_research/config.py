@@ -11,6 +11,7 @@ EXPORT_DIR = ROOT_DIR / "exports"
 CACHE_DIR = DATA_DIR / "cache"
 RUNS_DIR = DATA_DIR / "runs"
 TEMPLATES_DIR = DATA_DIR / "templates"
+CORPUS_DIR = DATA_DIR / "corpus"
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class AppConfig:
     cache_dir: Path = CACHE_DIR
     runs_dir: Path = RUNS_DIR
     templates_dir: Path = TEMPLATES_DIR
+    corpus_dir: Path = CORPUS_DIR
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "25"))
     playwright_timeout_ms: int = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "45000"))
     playwright_networkidle_timeout_ms: int = int(os.getenv("PLAYWRIGHT_NETWORKIDLE_TIMEOUT_MS", "6000"))
@@ -40,8 +42,13 @@ class AppConfig:
     yandex_folder: str = os.getenv("YANDEX_FOLDER", "")
     yandex_model: str = os.getenv("YANDEX_MODEL", "gpt-oss-120b/latest")
     yandex_base_url: str = os.getenv("YANDEX_BASE_URL", "https://ai.api.cloud.yandex.net/v1")
+    github_corpus_enabled: bool = os.getenv("GITHUB_CORPUS_ENABLED", "false").lower() == "true"
+    github_token: str = os.getenv("GITHUB_TOKEN", "")
+    github_repo: str = os.getenv("GITHUB_REPO", "")
+    github_branch: str = os.getenv("GITHUB_BRANCH", "main")
+    github_corpus_path: str = os.getenv("GITHUB_CORPUS_PATH", "research-corpus")
 
 
 def ensure_directories(config: AppConfig) -> None:
-    for path in [config.data_dir, config.export_dir, config.cache_dir, config.runs_dir, config.templates_dir]:
+    for path in [config.data_dir, config.export_dir, config.cache_dir, config.runs_dir, config.templates_dir, config.corpus_dir]:
         path.mkdir(parents=True, exist_ok=True)

@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional
 
 from .cache import JsonCache
 from .config import AppConfig
+from .corpus import ResearchCorpus
 from .llm import HeuristicProvider, cells_from_llm_payload, provider_from_config
 from .models import CompetitorInput, EvidenceCell, ResearchRun, ResearchTemplate, SourceArtifact, StageStatus
 from .normalization import align_cells_to_schema, detect_conflicts
@@ -23,6 +24,7 @@ class ResearchPipeline:
         self.cache = cache
         self.llm = provider_from_config(config)
         self.fallback_llm = HeuristicProvider()
+        self.corpus = ResearchCorpus(config)
 
     def run(
         self,
@@ -59,6 +61,11 @@ class ResearchPipeline:
             if cached_artifact:
                 artifact = SourceArtifact(**cached_artifact)
                 run.log("INFO", "Использую сохранённый источник из кэша.", "Парсинг", competitor.display_name())
+            elif competitor.url.strip() and (corpus_artifact := self.corpus.load_source(competitor.display_name(), competitor.url)):
+                artifact = corpus_artifact
+                if source_cache_key:
+                    self.cache.set("source_artifacts", source_cache_key, artifact_to_cache_value(artifact))
+                run.log("INFO", "Использую размеченный источник из corpus.", "Парсинг", competitor.display_name())
             else:
                 try:
                     artifact = fetch_source(
@@ -71,6 +78,7 @@ class ResearchPipeline:
                     )
                     if source_cache_key and artifact.status != "failed":
                         self.cache.set("source_artifacts", source_cache_key, artifact_to_cache_value(artifact))
+                    self.corpus.save_source(artifact, run.run_id, research_type)
                 except Exception as exc:
                     artifact = SourceArtifact(
                         competitor=competitor.display_name(),
@@ -138,6 +146,16 @@ class ResearchPipeline:
         raw_cells_by_competitor: Dict[str, List[EvidenceCell]] = {}
         for artifact in artifacts:
             raw_cells: List[EvidenceCell] = []
+            corpus_cells = self.corpus.load_extraction(
+                artifact.competitor,
+                artifact.url,
+                template.parameters,
+                EXTRACTION_PROMPT_VERSION,
+            )
+            if corpus_cells:
+                raw_cells_by_competitor[artifact.competitor] = corpus_cells
+                run.log("INFO", "Использую сохранённую LLM-разметку из corpus.", "LLM extraction", artifact.competitor)
+                continue
             chunks = chunks_by_competitor.get(artifact.competitor, [])
             for chunk_index, chunk in enumerate(chunks, start=1):
                 prompt = build_extraction_prompt(artifact.competitor, artifact.url, research_type, template.parameters, chunk)
@@ -159,6 +177,15 @@ class ResearchPipeline:
                 raw_cells.extend(cells_from_llm_payload(payload, artifact.url))
                 run.log("INFO", f"Chunk {chunk_index}/{len(chunks)} обработан.", "LLM extraction", artifact.competitor)
             raw_cells_by_competitor[artifact.competitor] = raw_cells
+            self.corpus.save_extraction(
+                artifact.competitor,
+                artifact.url,
+                template.parameters,
+                EXTRACTION_PROMPT_VERSION,
+                raw_cells,
+                run.run_id,
+                research_type,
+            )
         run.stage("LLM extraction").finish(StageStatus.SUCCESS, cells=sum(len(cells) for cells in raw_cells_by_competitor.values()))
 
         self._stage(run, "Нормализация", "Привожу значения к единому формату.", on_event, 0.68)

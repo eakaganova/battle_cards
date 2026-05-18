@@ -130,9 +130,19 @@ def compact_competitor_rows() -> None:
         }
         if any(value.strip() for value in normalized.values()):
             kept.append(normalized)
-    st.session_state.competitors = kept or [empty_competitor_row()]
-    reset_competitor_widget_state()
-    save_draft_state()
+    queue_competitor_rows(kept or [empty_competitor_row()])
+
+
+def has_filled_competitor_rows(rows: List[Dict[str, str]]) -> bool:
+    for row in rows:
+        if (
+            row.get("name", "").strip()
+            or row.get("url", "").strip()
+            or row.get("manual_text", "").strip()
+            or row.get("uploaded_text", "").strip()
+        ):
+            return True
+    return False
 
 
 def extract_uploaded_text(files) -> str:
@@ -266,12 +276,39 @@ def reset_competitor_widget_state(max_rows: int = 40) -> None:
                 del st.session_state[key]
 
 
+def hydrate_competitor_widget_state() -> None:
+    reset_competitor_widget_state(max(40, len(st.session_state.competitors) + 5))
+    for index, row in enumerate(st.session_state.competitors):
+        st.session_state[f"name_{index}"] = row.get("name", "")
+        st.session_state[f"url_{index}"] = row.get("url", "")
+        st.session_state[f"manual_{index}"] = row.get("manual_text", "")
+
+
+def queue_competitor_rows(rows: List[Dict[str, str]]) -> None:
+    st.session_state.pending_competitor_rows = rows
+
+
+def apply_pending_competitor_rows() -> None:
+    pending_rows = st.session_state.pop("pending_competitor_rows", None)
+    if pending_rows is None:
+        return
+    st.session_state.competitors = pending_rows
+    hydrate_competitor_widget_state()
+    save_draft_state()
+
+
 def sync_selected_preset(selected_preset: str) -> None:
     if selected_preset != st.session_state.active_preset:
+        sync_competitor_rows_from_widgets()
+        had_competitors = has_filled_competitor_rows(st.session_state.competitors)
         st.session_state.template_groups = (
             preset_groups(selected_preset) if selected_preset != "Свой список" else deepcopy(DEFAULT_TEMPLATE_GROUPS)
         )
         reset_template_widget_state()
+        if selected_preset != "Свой список" and not had_competitors:
+            st.session_state.competitors = preset_competitors(selected_preset) + [empty_competitor_row()]
+            hydrate_competitor_widget_state()
+            st.session_state.preset_apply_message = "Компании из пресета добавлены автоматически"
     st.session_state.active_preset = selected_preset
     save_draft_state()
 
@@ -279,20 +316,33 @@ def sync_selected_preset(selected_preset: str) -> None:
 def add_companies_to_editor(companies: List[Dict[str, str]]) -> None:
     sync_competitor_rows_from_widgets()
     current_rows = [
-        row
+        {
+            "name": row.get("name", ""),
+            "url": row.get("url", ""),
+            "manual_text": row.get("manual_text", ""),
+            "uploaded_text": row.get("uploaded_text", ""),
+        }
         for row in st.session_state.competitors
         if row.get("name", "").strip() or row.get("url", "").strip() or row.get("manual_text", "").strip() or row.get("uploaded_text", "").strip()
     ]
     existing = {(row.get("name", "").strip().lower(), row.get("url", "").strip().lower()) for row in current_rows}
+    added_count = 0
     for company in companies:
         key = (company.get("name", "").strip().lower(), company.get("url", "").strip().lower())
         if key not in existing:
-            current_rows.append(company)
+            current_rows.append(
+                {
+                    "name": company.get("name", ""),
+                    "url": company.get("url", ""),
+                    "manual_text": company.get("manual_text", ""),
+                    "uploaded_text": company.get("uploaded_text", ""),
+                }
+            )
             existing.add(key)
+            added_count += 1
     current_rows.append(empty_competitor_row())
-    st.session_state.competitors = current_rows
-    reset_competitor_widget_state()
-    save_draft_state()
+    queue_competitor_rows(current_rows)
+    st.session_state.preset_apply_message = f"Добавлено компаний из пресета: {added_count}"
     st.rerun()
 
 
@@ -300,6 +350,9 @@ def render_preset_company_picker(preset_name: str) -> None:
     if preset_name == "Свой список":
         return
     st.markdown("#### Компании из пресета")
+    if st.session_state.get("preset_apply_message"):
+        st.success(st.session_state.preset_apply_message)
+        st.session_state.preset_apply_message = ""
     preset_rows = preset_competitors(preset_name)
     selected: List[Dict[str, str]] = []
     for index, company in enumerate(preset_rows):
@@ -357,6 +410,7 @@ def render_exports(run: ResearchRun, diff: List[Dict[str, object]]) -> None:
 
 
 init_state()
+apply_pending_competitor_rows()
 
 st.title("AI-платформа конкурентного анализа")
 st.caption("Сравнительные таблицы с источниками, уверенностью, LLM-анализом, проверкой данных, версиями и экспортом.")
